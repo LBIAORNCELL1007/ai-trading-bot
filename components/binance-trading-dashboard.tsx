@@ -7,6 +7,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, Di
 import { GeminiAdvisor } from "@/lib/gemini-advisor"
 import { RiskManager } from "@/lib/risk-management"
 import { AgenticOrchestrator, StrategicDecision } from "@/lib/agentic-orchestrator"
+import { aiConfigEngine, type AIConfigResult } from "@/lib/ai-config-engine"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -70,7 +71,7 @@ import {
   type BinanceKline
 } from "@/lib/binance-websocket"
 import { MarketAnalyzer, type MarketAnalysis } from "@/lib/market-analyzer"
-import { WalkForwardAnalyzer } from "@/lib/walk-forward-analyzer"
+import { WalkForwardAnalyzer, type WFAReport } from "@/lib/walk-forward-analyzer"
 import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
 import { FinancialChart } from "@/components/financial-chart"
@@ -428,6 +429,16 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
   // Safety Layer State
   const [isSafetyLocked, setIsSafetyLocked] = useState(false)
   const [safetyReason, setSafetyReason] = useState<string | null>(null)
+
+  // AI Auto-Configure State
+  const [aiResult, setAiResult] = useState<AIConfigResult | null>(null)
+  const [isAIConfiguring, setIsAIConfiguring] = useState(false)
+  const [aiRecommendedFields, setAiRecommendedFields] = useState<Set<string>>(new Set())
+  const [aiLastAnalyzedAt, setAiLastAnalyzedAt] = useState<Date | null>(null)
+  const [pendingAiSuggestion, setPendingAiSuggestion] = useState<AIConfigResult | null>(null)
+  const aiAbortRef = useRef<AbortController | null>(null)
+  const aiManualOverrides = useRef<Set<string>>(new Set())
+
   /* AI State & Orchestration */
   const riskManagerRef = useRef(new RiskManager(10000))
   // Update RiskManager whenever riskPerTrade changes
@@ -449,6 +460,8 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
   // WFA Auto-Tune State
   const [isTuning, setIsTuning] = useState(false)
   const [tunedParams, setTunedParams] = useState<string | null>(null)
+  const [wfaReport, setWfaReport] = useState<WFAReport | null>(null)
+  const [showWfaResults, setShowWfaResults] = useState(false)
 
   const handleSelectCoin = (coin: any) => {
     toast({
@@ -501,18 +514,25 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
   const handleAutoTune = async () => {
     setIsTuning(true);
     setTunedParams(null);
+    setWfaReport(null);
     try {
-      // Fetch 500 candles for WFA
       const data = await getHistoricalKlines(selectedSymbol, selectedTimeframe, 500);
       if (data.length < 100) {
-        toast({ title: "Auto-Tune Failed", description: "Not enough historical data.", variant: "destructive" });
+        toast({ title: "Auto-Tune Failed", description: "Not enough historical data. Need 100+ candles.", variant: "destructive" });
         return;
       }
 
-      const bestParams = WalkForwardAnalyzer.runAnalysis(data);
-      if (bestParams) {
-        setTunedParams(`Robust Params Found: ${bestParams.id}`);
-        toast({ title: "🛠️ Auto-Tune Complete", description: `Found stable plateau: ${bestParams.id}`, duration: 5000 });
+      const report = WalkForwardAnalyzer.runAnalysis(data, selectedSymbol, selectedTimeframe);
+      setWfaReport(report);
+      setShowWfaResults(true);
+
+      if (report.bestResult) {
+        setTunedParams(`Best: ${report.bestResult.parameterSet.id}`);
+        toast({
+          title: "🛠️ Auto-Tune Complete",
+          description: `Tested ${report.paramCombinationsTested} combos across ${report.strategiesTested} strategies. Best: ${report.bestResult.parameterSet.id} (${report.bestResult.winRateOutOfSample.toFixed(0)}% OOS win rate)`,
+          duration: 6000
+        });
       } else {
         toast({ title: "Auto-Tune Complete", description: "No robust parameters found in recent history.", variant: "destructive" });
       }
@@ -816,6 +836,149 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
       })
     }
   }
+
+  // ════════════════════════════════════════════════════════════════
+  // AI AUTO-CONFIGURE HANDLER
+  // ════════════════════════════════════════════════════════════════
+
+  const handleAIAutoConfigure = useCallback(async (options?: { silent?: boolean }) => {
+    // Abort any in-flight analysis (race condition lock)
+    if (aiAbortRef.current) {
+      aiAbortRef.current.abort()
+    }
+    const abortCtrl = new AbortController()
+    aiAbortRef.current = abortCtrl
+
+    if (!options?.silent) setIsAIConfiguring(true)
+
+    try {
+      const portfolioCtx = {
+        totalPnL: portfolio.totalPnL,
+        equity: portfolio.equity,
+        openTrades: trades
+          .filter(t => t.status === 'OPEN')
+          .map(t => ({ symbol: t.symbol, side: t.side }))
+      }
+
+      const result = await aiConfigEngine.analyze(
+        selectedSymbol,
+        portfolioCtx,
+        abortCtrl.signal
+      )
+
+      if (abortCtrl.signal.aborted) return
+
+      setAiResult(result)
+      setAiLastAnalyzedAt(result.analyzedAt)
+
+      // Non-destructive logic: if engine is running or user has manual overrides, suggest don't apply
+      const shouldOnlySuggest = isRunning || aiManualOverrides.current.size > 0
+
+      if (shouldOnlySuggest && options?.silent) {
+        // Background refresh — just store as pending, don't overwrite
+        setPendingAiSuggestion(result)
+        return
+      }
+
+      if (result.confidence < 50) {
+        // Low confidence — suggest only, don't apply
+        setPendingAiSuggestion(result)
+        if (!options?.silent) {
+          toast({
+            title: "⚠️ AI Analysis — Low Confidence",
+            description: `Confidence ${result.confidence}% is too low to auto-apply. Review suggestions manually.`,
+            variant: "destructive"
+          })
+        }
+        return
+      }
+
+      // Apply configuration
+      applyAIConfig(result)
+
+      if (!options?.silent) {
+        const badge = result.confidence >= 70 ? '✦' : '⚠'
+        toast({
+          title: `${badge} AI Configuration Applied`,
+          description: `Strategy: ${result.strategy.replace(/_/g, ' ')} | Confidence: ${result.confidence}% | Regime: ${result.marketRegime}${
+            result.backtestResult ? ` | Backtest: ${result.backtestResult.winRate.toFixed(0)}% win rate` : ''
+          }`,
+        })
+      }
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return // Expected
+      console.error('[AIConfigEngine] Analysis failed:', err)
+      if (!options?.silent) {
+        toast({
+          title: "AI Analysis Failed",
+          description: err?.message || "Could not analyze market. Your current settings are unchanged.",
+          variant: "destructive"
+        })
+      }
+    } finally {
+      if (!abortCtrl.signal.aborted) {
+        setIsAIConfiguring(false)
+      }
+    }
+  }, [selectedSymbol, portfolio, trades, isRunning, toast])
+
+  const applyAIConfig = useCallback((result: AIConfigResult) => {
+    aiManualOverrides.current.clear()
+    const fields = new Set<string>()
+
+    setSelectedStrategy(result.strategy); fields.add('strategy')
+    setSelectedTimeframe(result.timeframe); fields.add('timeframe')
+    setRiskPerTrade(result.riskPerTrade); fields.add('riskPerTrade')
+    setMaxPositions(result.maxPositions); fields.add('maxPositions')
+    setStopLoss(result.stopLoss); fields.add('stopLoss')
+    setTakeProfit(result.takeProfit); fields.add('takeProfit')
+    setTrailingStop(result.trailingStop); fields.add('trailingStop')
+    setLeverage(result.leverage); fields.add('leverage')
+
+    setAiRecommendedFields(fields)
+    setPendingAiSuggestion(null)
+  }, [])
+
+  const applyPendingSuggestion = useCallback(() => {
+    if (pendingAiSuggestion) {
+      applyAIConfig(pendingAiSuggestion)
+      setAiResult(pendingAiSuggestion)
+      toast({
+        title: "✦ AI Suggestions Applied",
+        description: `Updated configuration with ${pendingAiSuggestion.confidence}% confidence.`,
+      })
+    }
+  }, [pendingAiSuggestion, applyAIConfig, toast])
+
+  // Mark field as manually overridden (removes AI badge)
+  const markManualOverride = useCallback((field: string) => {
+    aiManualOverrides.current.add(field)
+    setAiRecommendedFields(prev => {
+      const next = new Set(prev)
+      next.delete(field)
+      return next
+    })
+  }, [])
+
+  // Background refresh every 5 minutes
+  useEffect(() => {
+    const interval = setInterval(() => {
+      handleAIAutoConfigure({ silent: true })
+    }, 5 * 60 * 1000)
+    return () => clearInterval(interval)
+  }, [handleAIAutoConfigure])
+
+  // Auto-trigger on symbol change (debounced 800ms)
+  useEffect(() => {
+    const timeout = setTimeout(() => {
+      if (aiResult) {
+        // Only auto-re-analyze if user has already used AI at least once
+        handleAIAutoConfigure({ silent: true })
+      }
+    }, 800)
+    return () => clearTimeout(timeout)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSymbol])
 
   // Delete preset
   const handleDeletePreset = (name: string) => {
@@ -1651,6 +1814,97 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
               </div>
             </div>
 
+            {/* WFA Auto-Tune Results Panel */}
+            {showWfaResults && wfaReport && (
+              <Card className="bg-[#1A1A1A]/90 backdrop-blur-md border-blue-500/30 shadow-lg shadow-blue-900/10 animate-in fade-in slide-in-from-top-4 duration-500">
+                <CardHeader className="pb-2">
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <CardTitle className="text-sm flex items-center gap-2">
+                        <Settings className="h-4 w-4 text-blue-400" />
+                        Walk-Forward Analysis Results
+                      </CardTitle>
+                      <CardDescription className="text-xs">
+                        {wfaReport.symbol} · {wfaReport.timeframe} · {wfaReport.totalCandlesUsed} candles · {wfaReport.paramCombinationsTested} combos tested across {wfaReport.strategiesTested} strategies
+                      </CardDescription>
+                    </div>
+                    <button onClick={() => setShowWfaResults(false)} className="text-muted-foreground hover:text-foreground text-xs px-2 py-1 rounded hover:bg-[#333]/50">✕</button>
+                  </div>
+                </CardHeader>
+                <CardContent className="pt-2">
+                  {wfaReport.topResults.length === 0 ? (
+                    <p className="text-sm text-muted-foreground py-4 text-center">No robust parameters found — all tested combinations failed out-of-sample validation.</p>
+                  ) : (
+                    <div className="space-y-1">
+                      {/* Table Header */}
+                      <div className="grid grid-cols-12 gap-2 text-[10px] text-muted-foreground uppercase tracking-wider px-3 py-2 bg-black/30 rounded-t-md font-semibold">
+                        <span className="col-span-1">#</span>
+                        <span className="col-span-3">Config</span>
+                        <span className="col-span-2 text-right">In-Sample</span>
+                        <span className="col-span-2 text-right">Out-of-Sample</span>
+                        <span className="col-span-2 text-right">OOS Win%</span>
+                        <span className="col-span-2 text-right">Status</span>
+                      </div>
+                      {/* Result Rows */}
+                      {wfaReport.topResults.map((r, i) => (
+                        <div key={r.parameterSet.id} className={`grid grid-cols-12 gap-2 text-xs font-mono px-3 py-2 rounded-md transition-colors ${
+                          i === 0 ? 'bg-blue-500/10 border border-blue-500/30' : 'hover:bg-[#333]/30'
+                        }`}>
+                          <span className="col-span-1 text-muted-foreground">{i + 1}</span>
+                          <span className="col-span-3 text-foreground truncate" title={r.parameterSet.id}>
+                            {i === 0 && <span className="text-blue-400 mr-1">★</span>}
+                            {r.parameterSet.id}
+                          </span>
+                          <span className={`col-span-2 text-right ${r.inSamplePnLPercent > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {r.inSamplePnLPercent > 0 ? '+' : ''}{r.inSamplePnLPercent.toFixed(2)}%
+                            <span className="text-[9px] text-muted-foreground ml-1">({r.tradesInSample}t)</span>
+                          </span>
+                          <span className={`col-span-2 text-right ${r.outOfSamplePnLPercent > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                            {r.outOfSamplePnLPercent > 0 ? '+' : ''}{r.outOfSamplePnLPercent.toFixed(2)}%
+                            <span className="text-[9px] text-muted-foreground ml-1">({r.tradesOutOfSample}t)</span>
+                          </span>
+                          <span className={`col-span-2 text-right ${r.winRateOutOfSample >= 50 ? 'text-green-400' : 'text-yellow-400'}`}>
+                            {r.winRateOutOfSample.toFixed(0)}%
+                          </span>
+                          <span className="col-span-2 text-right">
+                            {r.isRobust
+                              ? <span className="text-green-400 text-[10px] px-1.5 py-0.5 bg-green-500/10 rounded">✓ Robust</span>
+                              : <span className="text-red-400 text-[10px] px-1.5 py-0.5 bg-red-500/10 rounded">✗ Weak</span>
+                            }
+                          </span>
+                        </div>
+                      ))}
+                      {/* Apply Best Button */}
+                      {wfaReport.bestResult && (
+                        <div className="flex items-center justify-between mt-3 pt-3 border-t border-[#333]/30">
+                          <p className="text-xs text-muted-foreground">
+                            ★ Best robust config: <span className="text-blue-400 font-semibold">{wfaReport.bestResult.parameterSet.id}</span>
+                            {' '} ({wfaReport.bestResult.parameterSet.strategy.replace(/_/g, ' ')})
+                          </p>
+                          <Button
+                            size="sm"
+                            className="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3"
+                            onClick={() => {
+                              const best = wfaReport.bestResult!;
+                              setSelectedStrategy(best.parameterSet.strategy);
+                              markManualOverride('strategy');
+                              setShowWfaResults(false);
+                              toast({
+                                title: "🛠️ Strategy Applied from Auto-Tune",
+                                description: `Switched to ${best.parameterSet.strategy.replace(/_/g, ' ')} (${best.parameterSet.id})`,
+                              });
+                            }}
+                          >
+                            Apply Strategy
+                          </Button>
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            )}
+
             {/* Detailed Asset Grid Layout - 3 COLUMN EXCHANGE Layout */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
               
@@ -2083,16 +2337,62 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
             
             <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
               <CardHeader>
-                <CardTitle>Trading Configuration</CardTitle>
-                <CardDescription>Configure your trading strategy and parameters</CardDescription>
+                <div className="flex items-center justify-between">
+                  <div>
+                    <CardTitle>Trading Configuration</CardTitle>
+                    <CardDescription>Configure your trading strategy and parameters</CardDescription>
+                  </div>
+                  <div className="flex flex-col items-end gap-1">
+                    <Button
+                      onClick={() => handleAIAutoConfigure()}
+                      disabled={isAIConfiguring}
+                      className="bg-gradient-to-r from-purple-600 to-[#1DB954] hover:from-purple-700 hover:to-[#1AA34A] text-white font-bold px-4 py-2 rounded-lg shadow-lg shadow-purple-900/20 text-xs"
+                    >
+                      {isAIConfiguring ? (
+                        <span className="flex items-center gap-1.5"><RotateCcw className="w-3.5 h-3.5 animate-spin" /> Analyzing...</span>
+                      ) : (
+                        <span className="flex items-center gap-1.5"><Zap className="w-3.5 h-3.5" /> AI Auto-Configure</span>
+                      )}
+                    </Button>
+                    {aiLastAnalyzedAt && (
+                      <span className="text-[10px] text-muted-foreground font-mono">
+                        Last: {aiLastAnalyzedAt.toLocaleTimeString()}
+                        {aiResult && <span className={`ml-1.5 font-bold ${aiResult.confidence >= 70 ? 'text-green-400' : aiResult.confidence >= 50 ? 'text-yellow-400' : 'text-red-400'}`}>{aiResult.confidence}% conf.</span>}
+                      </span>
+                    )}
+                    {pendingAiSuggestion && (
+                      <button
+                        onClick={applyPendingSuggestion}
+                        className="text-[10px] text-purple-400 hover:text-purple-300 underline cursor-pointer"
+                      >
+                        ✨ New AI suggestions available — click to apply
+                      </button>
+                    )}
+                  </div>
+                </div>
+                {aiResult && aiResult.backtestResult && aiResult.backtestResult.totalTrades > 0 && (
+                  <div className="mt-2 px-3 py-1.5 bg-black/40 rounded-md border border-[#333]/30 text-xs text-muted-foreground font-mono flex items-center gap-3">
+                    <span>📊 Backtest: <span className={aiResult.backtestResult.winRate >= 50 ? 'text-green-400' : 'text-red-400'}>{aiResult.backtestResult.winRate.toFixed(0)}% win rate</span></span>
+                    <span>• {aiResult.backtestResult.totalTrades} trades</span>
+                    <span>• PF {aiResult.backtestResult.profitFactor.toFixed(1)}</span>
+                    <span className="text-[9px] text-muted-foreground/60">(incl. 0.1% slippage)</span>
+                  </div>
+                )}
               </CardHeader>
               <CardContent className="space-y-6">
                 {/* Strategy Selection */}
                 <div>
-                  <label className="text-sm font-medium mb-2 block">Trading Strategy</label>
+                  <label className="text-sm font-medium mb-2 block">
+                    Trading Strategy
+                    {aiRecommendedFields.has('strategy') && (
+                      <span title={aiResult?.reasoning.strategy} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                        AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                      </span>
+                    )}
+                  </label>
                   <select
                     value={selectedStrategy}
-                    onChange={(e) => setSelectedStrategy(e.target.value)}
+                    onChange={(e) => { setSelectedStrategy(e.target.value); markManualOverride('strategy') }}
                     className="w-full px-3 py-2 border rounded-md bg-background"
                   >
                     <option value="MA_CROSSOVER">Moving Average Crossover - SMA 20/50/200 (Golden/Death Cross)</option>
@@ -2159,10 +2459,17 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
 
                   {/* Timeframe */}
                   <div>
-                    <label className="text-sm font-medium mb-2 block">Timeframe</label>
+                    <label className="text-sm font-medium mb-2 block">
+                      Timeframe
+                      {aiRecommendedFields.has('timeframe') && (
+                        <span title={aiResult?.reasoning.timeframe} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                          AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                        </span>
+                      )}
+                    </label>
                     <select
                       value={selectedTimeframe}
-                      onChange={(e) => setSelectedTimeframe(e.target.value)}
+                      onChange={(e) => { setSelectedTimeframe(e.target.value); markManualOverride('timeframe') }}
                       className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                     >
                       <option value="1m">1 Minute</option>
@@ -2178,7 +2485,14 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                 {/* Risk Settings */}
                 <div className="grid grid-cols-2 gap-4">
                   <div>
-                    <label className="text-sm font-medium mb-2 block">Risk Per Trade (%)</label>
+                    <label className="text-sm font-medium mb-2 block">
+                      Risk Per Trade (%)
+                      {aiRecommendedFields.has('riskPerTrade') && (
+                        <span title={aiResult?.reasoning.risk} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                          AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                        </span>
+                      )}
+                    </label>
                     <input
                       type="number"
                       min="0.5"
@@ -2188,6 +2502,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                       onChange={(e) => {
                         const val = parseFloat(e.target.value)
                         setRiskPerTrade(isNaN(val) ? 0 : val)
+                        markManualOverride('riskPerTrade')
                       }}
                       className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                     />
@@ -2195,7 +2510,14 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                   </div>
 
                   <div>
-                    <label className="text-sm font-medium mb-2 block">Max Positions</label>
+                    <label className="text-sm font-medium mb-2 block">
+                      Max Positions
+                      {aiRecommendedFields.has('maxPositions') && (
+                        <span title={aiResult?.reasoning.maxPositions} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                          AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                        </span>
+                      )}
+                    </label>
                     <input
                       type="number"
                       min="1"
@@ -2204,6 +2526,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                       onChange={(e) => {
                         const val = parseInt(e.target.value)
                         setMaxPositions(isNaN(val) ? 1 : val)
+                        markManualOverride('maxPositions')
                       }}
                       className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                     />
@@ -2215,44 +2538,72 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                   <h4 className="text-sm font-semibold mb-3">Advanced Risk Management</h4>
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <label className="text-sm font-medium mb-2 block">Stop Loss (%)</label>
+                      <label className="text-sm font-medium mb-2 block">
+                        Stop Loss (%)
+                        {aiRecommendedFields.has('stopLoss') && (
+                          <span title={aiResult?.reasoning.stopLoss} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                            AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                          </span>
+                        )}
+                      </label>
                       <input
                         type="number"
                         min="0.1"
                         step="0.1"
                         value={stopLoss}
-                        onChange={(e) => setStopLoss(parseFloat(e.target.value) || 0)}
+                        onChange={(e) => { setStopLoss(parseFloat(e.target.value) || 0); markManualOverride('stopLoss') }}
                         className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                       />
                     </div>
                     <div>
-                      <label className="text-sm font-medium mb-2 block">Take Profit (%)</label>
+                      <label className="text-sm font-medium mb-2 block">
+                        Take Profit (%)
+                        {aiRecommendedFields.has('takeProfit') && (
+                          <span title={aiResult?.reasoning.takeProfit} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                            AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                          </span>
+                        )}
+                      </label>
                       <input
                         type="number"
                         min="0.1"
                         step="0.1"
                         value={takeProfit}
-                        onChange={(e) => setTakeProfit(parseFloat(e.target.value) || 0)}
+                        onChange={(e) => { setTakeProfit(parseFloat(e.target.value) || 0); markManualOverride('takeProfit') }}
                         className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                       />
                     </div>
                     <div>
-                      <label className="text-sm font-medium mb-2 block">Trailing Stop (%)</label>
+                      <label className="text-sm font-medium mb-2 block">
+                        Trailing Stop (%)
+                        {aiRecommendedFields.has('trailingStop') && (
+                          <span title={aiResult?.reasoning.trailingStop} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                            AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                          </span>
+                        )}
+                      </label>
                       <input
                         type="number"
                         min="0.1"
                         step="0.1"
                         value={trailingStop}
-                        onChange={(e) => setTrailingStop(parseFloat(e.target.value) || 0)}
+                        onChange={(e) => { setTrailingStop(parseFloat(e.target.value) || 0); markManualOverride('trailingStop') }}
                         className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                       />
                       <p className="text-xs text-muted-foreground mt-1">Locks in profit as price rises</p>
                     </div>
                     <div>
-                      <label className="text-sm font-medium mb-2 block">Simulated Leverage (x)</label>
+                      <label className="text-sm font-medium mb-2 block">
+                        Simulated Leverage (x)
+                        {aiRecommendedFields.has('leverage') && (
+                          <span title={aiResult?.reasoning.leverage} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                            AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                          </span>
+                        )}
+                      </label>
                       <select
                         value={leverage}
-                        onChange={(e) => setLeverage(parseInt(e.target.value))}
+                        onChange={(e) => { setLeverage(parseInt(e.target.value)); markManualOverride('leverage') }}
                         className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                       >
                         <option value="1">1x (Spot)</option>
