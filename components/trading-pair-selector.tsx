@@ -11,7 +11,7 @@ import { useOptimizedSearch } from '@/hooks/use-optimized-search'
 
 export function TradingPairSelector() {
   const [isOpen, setIsOpen] = useState(false)
-  const { query, results: searchResults, cacheReady, search, searchLoading } = useOptimizedSearch()
+  const { query, results: searchResults, cacheReady, search, loading: searchLoading } = useOptimizedSearch()
 
   const handleSearch = (e: React.ChangeEvent<HTMLInputElement>) => {
     const value = e.target.value
@@ -30,7 +30,7 @@ export function TradingPairSelector() {
   }
 
   return (
-    <Card>
+    <Card className="bg-[#1A1A1A] border-[#333]/50 shadow-xl backdrop-blur-sm overflow-hidden">
       <CardHeader>
         <CardTitle>Trading Pair Selector</CardTitle>
       </CardHeader>
@@ -52,7 +52,7 @@ export function TradingPairSelector() {
             onBlur={() => {
               setTimeout(() => setIsOpen(false), 200)
             }}
-            className="pl-12 pr-10 h-12 border-2 border-primary/20 focus:border-primary transition-colors"
+            className="pl-12 pr-10 h-12 bg-[#121212] border-2 border-[#1DB954]/20 focus:border-[#1DB954] focus:bg-[#1DB954]/5 transition-all text-foreground placeholder:text-muted-foreground/60"
           />
           {!cacheReady && (
             <Loader className="absolute right-4 top-1/2 transform -translate-y-1/2 h-5 w-5 text-primary animate-spin" />
@@ -60,15 +60,15 @@ export function TradingPairSelector() {
         </div>
 
         {isOpen && query.trim().length >= 1 && cacheReady && (
-          <div className="border border-border rounded-lg overflow-hidden bg-muted/50">
+          <div className="border border-[#333]/50 rounded-lg overflow-hidden bg-[#121212] shadow-2xl">
             {searchResults.length > 0 ? (
               <div className="max-h-64 overflow-y-auto">
                 {searchResults.slice(0, 15).map((coin) => (
                   <Link
                     key={coin.id}
-                    href={`/coins/${coin.id}`}
+                    href={`/trade/${coin.symbol.toUpperCase()}`}
                     onClick={handleSelectCoin}
-                    className="flex items-center gap-3 p-3 hover:bg-muted transition-colors border-b last:border-0 cursor-pointer"
+                    className="flex items-center gap-3 p-3 hover:bg-[#1DB954]/5 transition-colors border-b border-[#333]/30 last:border-0 cursor-pointer group"
                   >
                     <img
                       src={coin.image || '/placeholder.svg'}
@@ -100,9 +100,10 @@ export function TradingPairSelector() {
           </div>
         )}
 
-        <div className="bg-blue-500/10 border border-blue-500/20 rounded-lg p-4 text-sm">
-          <p className="text-blue-600 dark:text-blue-400">
-            💡 Tip: Start typing any coin name or symbol. Results include Bitcoin, Ethereum, Cardano, Dogecoin, Shiba Inu, and thousands more including altcoins and memecoins.
+        <div className="bg-[#1DB954]/5 border border-[#1DB954]/20 rounded-xl p-5 text-sm">
+          <p className="text-[#1DB954] font-medium leading-relaxed">
+            <span className="mr-2">💡</span>
+            <span className="opacity-80">Tip: Start typing any coin name or symbol. Results include Bitcoin, Ethereum, Cardano, Dogecoin, Shiba Inu, and thousands more including altcoins and memecoins.</span>
           </p>
         </div>
       </CardContent>

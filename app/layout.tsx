@@ -7,10 +7,8 @@ import { AppHeader } from "@/components/app-header"
 const inter = Inter({ subsets: ["latin"] })
 
 export const metadata: Metadata = {
-  title: "CryptoTracker - Live Cryptocurrency Prices & Market Data",
-  description: "Track real-time cryptocurrency prices, market cap, volume, and supply data for 10,000+ coins including Bitcoin, Ethereum, and memecoins",
-  keywords: "crypto, bitcoin, ethereum, cryptocurrency prices, market cap, trading, blockchain",
-    generator: 'v0.app'
+  title: "CryptoTracker - AI Trading Bot",
+  description: "Modern AI Trading Interface",
 }
 
 export default function RootLayout({
@@ -19,10 +17,18 @@ export default function RootLayout({
   children: React.ReactNode
 }) {
   return (
-    <html lang="en">
-      <body className={inter.className}>
+    <html lang="en" className="dark">
+      <body
+        className={`${inter.className} antialiased`}
+        style={{
+          backgroundColor: '#121212', // Your Matte Black/Charcoal
+          color: '#EAEAEA',
+          margin: 0,
+          minHeight: '100vh'
+        }}
+      >
         <AppHeader />
-        {children}
+        <main>{children}</main>
       </body>
     </html>
   )

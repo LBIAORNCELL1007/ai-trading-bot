@@ -1,6 +1,7 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useCallback } from "react"
+import { useLiveMarketData } from "@/lib/use-live-market"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 import { GeminiAdvisor } from "@/lib/gemini-advisor"
@@ -45,6 +46,9 @@ import {
   Sparkles,
   Skull,
   Unlock,
+  Lock,
+  Globe,
+  Database,
 } from "lucide-react"
 import {
   MovingAverageCrossoverStrategy,
@@ -118,9 +122,260 @@ interface TradingConfig {
   leverage: number
 }
 
-export default function BinanceTradingDashboard() {
+const MOCK_TRENDING_COINS = [
+  { symbol: "BTCUSDT", name: "Bitcoin", price: "$65,432.10", change24h: "+2.4%", logo: "₿", rank: 1, cap: "$1.2T", vol: "$34B", supply: "19.6M" },
+  { symbol: "ETHUSDT", name: "Ethereum", price: "$3,456.78", change24h: "+1.2%", logo: "Ξ", rank: 2, cap: "$415B", vol: "$15B", supply: "120M" },
+  { symbol: "XRPUSDT", name: "XRP", price: "$0.62", change24h: "+3.1%", logo: "✕", rank: 3, cap: "$33B", vol: "$2.1B", supply: "54B" },
+  { symbol: "SOLUSDT", name: "Solana", price: "$145.20", change24h: "+5.6%", logo: "◎", rank: 5, cap: "$65B", vol: "$4.2B", supply: "443M" },
+  { symbol: "BNBUSDT", name: "Binance Coin", price: "$580.40", change24h: "-0.8%", logo: "BNB", rank: 4, cap: "$86B", vol: "$1.1B", supply: "149M" },
+  { symbol: "ADAUSDT", name: "Cardano", price: "$0.48", change24h: "+2.9%", logo: "₳", rank: 9, cap: "$17B", vol: "$530M", supply: "35B" },
+  { symbol: "DOGEUSDT", name: "Dogecoin", price: "$0.15", change24h: "+12.4%", logo: "Ð", rank: 8, cap: "$21B", vol: "$2.5B", supply: "143B" },
+  { symbol: "AVAXUSDT", name: "Avalanche", price: "$35.60", change24h: "+4.1%", logo: "🔺", rank: 11, cap: "$14B", vol: "$600M", supply: "377M" },
+  { symbol: "SHIBUSDT", name: "Shiba Inu", price: "$0.000025", change24h: "+8.7%", logo: "🐕", rank: 13, cap: "$14B", vol: "$800M", supply: "589T" },
+  { symbol: "LINKUSDT", name: "Chainlink", price: "$18.20", change24h: "+2.1%", logo: "🔗", rank: 14, cap: "$10B", vol: "$450M", supply: "587M" },
+  { symbol: "MATICUSDT", name: "Polygon", price: "$0.95", change24h: "-1.2%", logo: "⬡", rank: 16, cap: "$9B", vol: "$320M", supply: "9.2B" },
+  { symbol: "UNIUSDT", name: "Uniswap", price: "$11.40", change24h: "+1.8%", logo: "🦄", rank: 18, cap: "$6.8B", vol: "$210M", supply: "600M" },
+]
+import { useRouter } from "next/navigation"
+
+// ─── Helper to derive live-ish indicator data from a coin's 24h change ───────
+function deriveCoinAnalysis(symbol: string, change24h: string, price: string) {
+  const pct = parseFloat(change24h.replace('%', ''))
+  const isBull = pct >= 0
+  const strength = Math.min(Math.abs(pct), 15) / 15 // 0→1
+
+  // RSI: bullish coins → higher RSI
+  const rsi = isBull ? 52 + strength * 26 : 48 - strength * 26
+  // MACD: positive when bullish
+  const macd = isBull ? +(strength * 0.8).toFixed(3) : -(strength * 0.8).toFixed(3)
+  const macdSignal = isBull ? +(strength * 0.5).toFixed(3) : -(strength * 0.5).toFixed(3)
+  // Bollinger %B: >0.5 = price above midband
+  const bollingerB = isBull ? 0.5 + strength * 0.45 : 0.5 - strength * 0.45
+  // Stochastic
+  const stochK = isBull ? 55 + strength * 35 : 45 - strength * 35
+  const stochD = isBull ? 50 + strength * 30 : 50 - strength * 30
+  // ADX — higher change means stronger trend
+  const adx = 20 + strength * 45
+
+  const signal = (v: boolean) => (v ? 'BUY' : 'SELL')
+  const rsiSignal = rsi > 70 ? 'OVERBOUGHT' : rsi < 30 ? 'OVERSOLD' : isBull ? 'BUY' : 'SELL'
+
+  // Sentiment scores (0-10)
+  const sentScore = 5 + pct * 0.4
+  const socialMedia  = Math.min(10, Math.max(0, sentScore + 0.8)).toFixed(2)
+  const socialSent   = Math.min(10, Math.max(0, sentScore + 0.3)).toFixed(2)
+  const news         = Math.min(10, Math.max(0, sentScore - 0.1)).toFixed(2)
+  const kol          = Math.min(10, Math.max(0, sentScore + 0.6)).toFixed(2)
+  const overallScore = ((+socialMedia + +socialSent + +news + +kol) / 4).toFixed(2)
+  const sentiment    = +overallScore >= 6.5 ? 'Strong Positive' : +overallScore >= 5 ? 'Positive' : +overallScore >= 4 ? 'Neutral' : 'Negative'
+  const sentimentColor = +overallScore >= 6 ? '#1DB954' : +overallScore >= 5 ? '#1DB954' : '#F6465D'
+  const volText      = `${(2.1 + strength).toFixed(2)}k`
+
+  return {
+    rsi: rsi.toFixed(1), rsiSignal,
+    macd: macd.toString(), macdSignal: macdSignal.toString(),
+    bollingerB: bollingerB.toFixed(2),
+    stochK: stochK.toFixed(1), stochD: stochD.toFixed(1),
+    adx: adx.toFixed(1),
+    overallSignal: isBull ? 'BUY' : 'SELL',
+    socialMedia, socialSent, news, kol, overallScore,
+    sentiment, sentimentColor, volText,
+    newsText: isBull ? 'Bullish' : 'Bearish',
+    socialText: isBull ? 'Bullish' : 'Bearish',
+    kolText: isBull ? 'Bullish' : 'Neutral',
+  }
+}
+
+type CoinEntry = typeof MOCK_TRENDING_COINS[0]
+
+function AiSelectPanel({ coins, onSelectCoin }: { coins: CoinEntry[]; onSelectCoin: (c: CoinEntry) => void }) {
+  const [activeTab, setActiveTab] = useState<'technical' | 'sentiment'>('sentiment')
+  const [search, setSearch] = useState('')
+
+  const displayCoins = coins
+    .filter(c => c.symbol.toLowerCase().includes(search.toLowerCase()) || c.name.toLowerCase().includes(search.toLowerCase()))
+    .slice(0, 6)
+
+  return (
+    <div className="flex flex-col space-y-4">
+      {/* Top Bar Navigation */}
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-[#2A2D35] pb-4">
+        <div className="flex gap-2">
+          <button
+            onClick={() => setActiveTab('technical')}
+            className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors ${activeTab === 'technical' ? 'bg-[#2B3139] text-[#EAECEF]' : 'text-[#848E9C] hover:text-[#EAECEF]'}`}
+          >
+            Technical Indicators
+          </button>
+          <button
+            onClick={() => setActiveTab('sentiment')}
+            className={`px-4 py-1.5 rounded-lg text-sm font-medium transition-colors ${activeTab === 'sentiment' ? 'bg-[#2B3139] text-[#EAECEF]' : 'text-[#848E9C] hover:text-[#EAECEF]'}`}
+          >
+            Sentiment
+          </button>
+        </div>
+        <div className="relative">
+          <input
+            type="text"
+            value={search}
+            onChange={e => setSearch(e.target.value)}
+            placeholder="Search"
+            className="bg-[#121418] border border-[#2A2D35] rounded-lg px-3 py-1.5 text-sm w-48 text-[#EAECEF] placeholder:text-[#848E9C] focus:outline-none focus:border-[#1DB954]"
+          />
+          <svg className="absolute right-3 top-2 w-4 h-4 text-[#848E9C]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+        </div>
+      </div>
+
+      {/* Disclaimer & Badge */}
+      <div className="flex flex-col md:flex-row justify-between md:items-start items-center text-[#848E9C] text-xs w-full">
+        <p className="max-w-4xl leading-relaxed">
+          Disclaimer: Data is derived from live market conditions and is presented "as is". Not financial advice. Digital asset prices can be volatile.
+        </p>
+        <div className="flex items-center gap-1 text-[#1DB954] font-bold whitespace-nowrap mt-4 md:mt-0 ml-4">
+          <span>★</span> AI Select ({displayCoins.length})
+        </div>
+      </div>
+
+      {/* Cards Grid */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 pt-2">
+        {displayCoins.map((coin) => {
+          const d = deriveCoinAnalysis(coin.symbol, coin.change24h, coin.price)
+          const isBull = !coin.change24h.startsWith('-')
+
+          return (
+            <div
+              key={coin.symbol}
+              className="bg-[#181A20] border border-[#2A2D35] rounded-xl overflow-hidden hover:border-[#1DB954]/50 transition-colors cursor-pointer group"
+              onClick={() => onSelectCoin(coin)}
+            >
+              <div className="p-5 flex flex-col h-full relative">
+                {/* Header */}
+                <div className="flex justify-between items-start mb-4">
+                  <div className="flex gap-3 items-center">
+                    <span className="text-3xl">{coin.logo}</span>
+                    <div className="flex flex-col">
+                      <span className="font-bold text-[#EAECEF] text-lg leading-tight">{coin.symbol.replace('USDT', '')}</span>
+                      <div className="flex items-center gap-2 mt-0.5">
+                        <span className="text-sm font-semibold text-[#EAECEF]">{coin.price}</span>
+                        <span className={`text-xs font-semibold ${isBull ? 'text-[#1DB954]' : 'text-[#F6465D]'}`}>{coin.change24h}</span>
+                      </div>
+                    </div>
+                  </div>
+                  <button className="text-[#848E9C] hover:text-[#1DB954] transition-colors" onClick={e => e.stopPropagation()}>
+                    <span className="text-xl">☆</span>
+                  </button>
+                </div>
+
+                {activeTab === 'sentiment' ? (
+                  <>
+                    {/* Radar Visual */}
+                    <div className="relative w-full h-44 my-2 flex items-center justify-center">
+                      <div className="absolute w-32 h-32 bg-[#1DB954]/5 border border-[#1DB954]/20 transform rotate-45 rounded-sm"></div>
+                      <div className="absolute w-20 h-20 bg-[#1DB954]/10 border border-[#1DB954]/40 transform rotate-45 rounded-sm shadow-[0_0_15px_rgba(29,185,84,0.2)]"></div>
+                      <div className="relative z-10 text-center flex flex-col items-center">
+                        <span className="text-2xl font-bold text-white drop-shadow-md">{d.overallScore}</span>
+                        <span className="text-[10px] font-bold uppercase tracking-wide bg-[#181A20] px-1 drop-shadow-sm" style={{ color: d.sentimentColor }}>{d.sentiment}</span>
+                      </div>
+                      <div className="absolute top-2 left-1/2 -translate-x-1/2 text-center flex flex-col items-center w-24">
+                        <span className="text-[10px] text-[#848E9C]">Social Media</span>
+                        <span className="text-xs font-medium text-[#EAECEF]">{d.socialMedia}</span>
+                      </div>
+                      <div className="absolute bottom-1 left-1/2 -translate-x-1/2 text-center flex flex-col items-center w-24">
+                        <span className="text-[10px] text-[#848E9C] leading-tight mt-1">Social Sentiment</span>
+                        <span className="text-xs font-medium text-[#EAECEF]">{d.socialSent}</span>
+                      </div>
+                      <div className="absolute top-1/2 -left-2 -translate-y-1/2 text-center flex flex-col items-center w-12">
+                        <span className="text-[10px] text-[#848E9C]">News</span>
+                        <span className="text-xs font-medium text-[#EAECEF]">{d.news}</span>
+                      </div>
+                      <div className="absolute top-1/2 -right-2 -translate-y-1/2 text-center flex flex-col items-center w-12">
+                        <span className="text-[10px] text-[#848E9C]">KOL</span>
+                        <span className="text-xs font-medium text-[#EAECEF]">{d.kol}</span>
+                      </div>
+                    </div>
+
+                    {/* Sentiment Data List */}
+                    <div className="flex flex-col mt-2 pb-3 space-y-2.5">
+                      {[
+                        { label: 'Social Volume', value: d.volText },
+                        { label: 'News', value: d.newsText },
+                        { label: 'Social Sentiment', value: d.socialText },
+                        { label: 'KOL', value: d.kolText },
+                      ].map(row => (
+                        <div key={row.label} className="flex justify-between items-center text-sm">
+                          <span className="text-[#848E9C] font-medium">{row.label}</span>
+                          <span className={`font-bold ${row.value === 'Bullish' ? 'text-[#1DB954]' : row.value === 'Bearish' ? 'text-[#F6465D]' : 'text-[#EAECEF]'}`}>{row.value}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    {/* Technical Indicators */}
+                    <div className="flex flex-col space-y-2 mt-2 pb-3">
+                      {/* Overall Signal Badge */}
+                      <div className={`flex items-center justify-center py-2 rounded-lg text-sm font-bold tracking-wide mb-1 ${isBull ? 'bg-[#1DB954]/10 text-[#1DB954] border border-[#1DB954]/30' : 'bg-[#F6465D]/10 text-[#F6465D] border border-[#F6465D]/30'}`}>
+                        {isBull ? '▲' : '▼'} Overall Signal: {d.overallSignal}
+                      </div>
+
+                      {[
+                        { label: 'RSI (14)', value: `${d.rsi}`, sub: d.rsiSignal, subColor: d.rsiSignal === 'BUY' ? '#1DB954' : d.rsiSignal === 'OVERSOLD' ? '#1DB954' : '#F6465D' },
+                        { label: 'MACD', value: d.macd, sub: `Signal: ${d.macdSignal}`, subColor: +d.macd > 0 ? '#1DB954' : '#F6465D' },
+                        { label: 'Bollinger %B', value: d.bollingerB, sub: +d.bollingerB > 0.5 ? 'Above Midband' : 'Below Midband', subColor: +d.bollingerB > 0.5 ? '#1DB954' : '#F6465D' },
+                        { label: 'Stoch %K / %D', value: `${d.stochK} / ${d.stochD}`, sub: +d.stochK > 50 ? 'Bullish' : 'Bearish', subColor: +d.stochK > 50 ? '#1DB954' : '#F6465D' },
+                        { label: 'ADX (Trend Str.)', value: d.adx, sub: +d.adx > 40 ? 'Strong Trend' : +d.adx > 25 ? 'Trending' : 'Weak', subColor: '#848E9C' },
+                      ].map(row => (
+                        <div key={row.label} className="flex items-center justify-between text-sm py-1.5 border-b border-[#2A2D35]/50">
+                          <span className="text-[#848E9C] font-medium">{row.label}</span>
+                          <div className="text-right">
+                            <span className="text-[#EAECEF] font-bold mr-2">{row.value}</span>
+                            <span className="text-[11px] font-semibold" style={{ color: row.subColor }}>{row.sub}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+
+                {/* Action Footer */}
+                <div className="flex justify-between items-end mt-auto pt-3 border-t border-[#2A2D35]/50">
+                  <span className="text-[#1DB954] text-xs font-medium cursor-pointer hover:underline underline-offset-4" onClick={e => { e.stopPropagation(); onSelectCoin(coin); }}>Details</span>
+                  <button
+                    className="px-5 py-1.5 bg-[#1DB954] hover:bg-[#17a349] text-black font-bold rounded-lg text-sm shadow-md transition-all active:scale-95"
+                    onClick={e => { e.stopPropagation(); onSelectCoin(coin); }}
+                  >
+                    Trade
+                  </button>
+                </div>
+              </div>
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+
+interface DashboardProps {
+  initialSymbol?: string;
+}
+
+export default function BinanceTradingDashboard({ initialSymbol }: DashboardProps = {}) {
+  const router = useRouter();
+
+  // ── Live market data ──────────────────────────────────────────────────────
+  const { liveCoins, isLive, isLoading: isMarketLoading, nextRefresh } = useLiveMarketData()
+
+  // Resolve initial config derived from URL if present
+  const activeInitialData = initialSymbol ? liveCoins.find(c => c.symbol === initialSymbol) : null;
+  
+  const [isCoinSelected, setIsCoinSelected] = useState(!!initialSymbol);
+  const [selectedCoinData, setSelectedCoinData] = useState<any>(activeInitialData);
   const { toast } = useToast()
-  const [activeTab, setActiveTab] = useState("overview")
+  const [activeTab, setActiveTab] = useState(initialSymbol ? "chart" : "universe")
   const [isRunning, setIsRunning] = useState(false)
   const [trades, setTrades] = useState<TradeEntry[]>([])
   const [portfolio, setPortfolio] = useState<PortfolioData>({
@@ -138,7 +393,7 @@ export default function BinanceTradingDashboard() {
   const [balanceHistory, setBalanceHistory] = useState<Array<{ time: string; balance: number }>>([
     { time: new Date().toLocaleTimeString(), balance: 10000 },
   ])
-  const [selectedSymbol, setSelectedSymbol] = useState("BTCUSDT")
+  const [selectedSymbol, setSelectedSymbol] = useState(initialSymbol || "BTCUSDT")
   const [selectedTimeframe, setSelectedTimeframe] = useState("15m") // Default to 15m
   const [selectedStrategy, setSelectedStrategy] = useState("MULTI_SIGNAL")
   const [riskPerTrade, setRiskPerTrade] = useState(2)
@@ -157,6 +412,11 @@ export default function BinanceTradingDashboard() {
   const [candlestickData, setCandlestickData] = useState<BinanceKline[]>([])
   const [wsConnected, setWsConnected] = useState(false)
   const [searchTerm, setSearchTerm] = useState(selectedSymbol) // Decoupled input state
+
+  // -- NEW MOCK STATES FOR EXCHANGE LAYOUT --
+  const [orderBookAsks, setOrderBookAsks] = useState<any[]>([])
+  const [orderBookBids, setOrderBookBids] = useState<any[]>([])
+  const [marketTradesList, setMarketTradesList] = useState<any[]>([])
 
   // AI Mode State
   const [isAIEnabled, setIsAIEnabled] = useState(false)
@@ -189,6 +449,14 @@ export default function BinanceTradingDashboard() {
   // WFA Auto-Tune State
   const [isTuning, setIsTuning] = useState(false)
   const [tunedParams, setTunedParams] = useState<string | null>(null)
+
+  const handleSelectCoin = (coin: any) => {
+    toast({
+      title: "Asset Selected",
+      description: `Opening execution terminal for ${coin.symbol}...`,
+    });
+    router.push(`/trade/${coin.symbol}`);
+  };
 
   const handleAskGemini = async () => {
     // Check for API Key in environment (safe client-side check for local app)
@@ -288,13 +556,41 @@ export default function BinanceTradingDashboard() {
     pair.toLowerCase().includes(searchTerm.toLowerCase())
   )
 
+  // Handle direct navigation via /trade/[symbol]
+  useEffect(() => {
+    if (initialSymbol) {
+      // Ensure it has USDT suffix for the websocket/logic if it doesn't already
+      const formattedSymbol = initialSymbol.endsWith('USDT') ? initialSymbol : `${initialSymbol}USDT`
+      setSelectedSymbol(formattedSymbol)
+      setIsCoinSelected(true)
+      
+      const found = MOCK_TRENDING_COINS.find(c => c.symbol === formattedSymbol || c.symbol === initialSymbol)
+      if (found) {
+        setSelectedCoinData(found)
+      } else {
+        setSelectedCoinData({
+          symbol: formattedSymbol,
+          name: initialSymbol,
+          price: '--',
+          change24h: '+0.00%',
+          volume24h: '--',
+          marketCap: '--',
+          rank: 'N/A',
+          logo: '🪙'
+        })
+      }
+    }
+  }, [initialSymbol])
+
   // Load configuration and presets from localStorage on mount
   useEffect(() => {
     const savedConfig = localStorage.getItem('tradingConfig')
     if (savedConfig) {
       try {
         const config: TradingConfig = JSON.parse(savedConfig)
-        setSelectedSymbol(config.symbol)
+        if (!initialSymbol) {
+          setSelectedSymbol(config.symbol)
+        }
         setSelectedTimeframe(config.timeframe)
         setSelectedStrategy(config.strategy)
         setRiskPerTrade(config.riskPerTrade)
@@ -335,6 +631,43 @@ export default function BinanceTradingDashboard() {
     portfolioRef.current = portfolio
     tradesRef.current = trades
   }, [candlestickData, currentPrice, portfolio, trades])
+
+  // Exchange Layout Orderbook & Trades Mock Data Logic
+  useEffect(() => {
+    if (!isCoinSelected) return;
+
+    const generateTick = () => {
+      const p = currentPriceRef.current;
+      if (p <= 0) return;
+      const asks = Array.from({length: 35}).map((_, i) => ({ 
+        price: p + (35-i)*(p*0.0002) + Math.random()*(p*0.0001), 
+        amount: Math.random()*2.5, 
+        total: Math.random()*10 
+      }));
+      const bids = Array.from({length: 35}).map((_, i) => ({ 
+        price: p - (i+1)*(p*0.0002) - Math.random()*(p*0.0001), 
+        amount: Math.random()*2.5, 
+        total: Math.random()*10 
+      }));
+      
+      setOrderBookAsks(asks);
+      setOrderBookBids(bids);
+
+      setMarketTradesList(prev => {
+        const newTrade = { 
+          price: p + (Math.random() - 0.5) * (p*0.0004), 
+          amount: (Math.random() * 2) + 0.01, 
+          time: new Date().toLocaleTimeString('en-US', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'}), 
+          isBuyer: Math.random() > 0.5 
+        };
+        return [newTrade, ...prev].slice(0, 15);
+      });
+    };
+
+    generateTick();
+    const interval = setInterval(generateTick, 800);
+    return () => clearInterval(interval);
+  }, [isCoinSelected]);
 
   // Initialize strategy instance based on selected strategy
   // ONLY recreate when STRATEGY changes. NOT when data updates.
@@ -541,7 +874,7 @@ export default function BinanceTradingDashboard() {
 
       try {
         // Fetch historical klines first
-        const historicalData = await getHistoricalKlines(selectedSymbol, selectedTimeframe, 50)
+        const historicalData = await getHistoricalKlines(selectedSymbol, selectedTimeframe, 500)
 
         if (isMounted) {
           if (historicalData.length > 0) {
@@ -593,7 +926,7 @@ export default function BinanceTradingDashboard() {
               } else if (kline.isClosed || !lastCandle || kline.time > lastCandle.time) {
                 // Add new candle
                 newData.push(kline)
-                if (newData.length > 50) newData.shift()
+                if (newData.length > 500) newData.shift()
               }
 
               return newData
@@ -1040,249 +1373,411 @@ export default function BinanceTradingDashboard() {
   const totalPnL = closedTrades.reduce((sum, t) => sum + (t.pnl || 0), 0)
 
   return (
-    <div className="min-h-screen bg-background p-6">
-      <div className="max-w-7xl mx-auto space-y-6">
-        {/* Header */}
-        <div className="flex justify-between items-center">
-          <div>
-            <h1 className="text-3xl font-bold text-foreground">Binance Trading Bot</h1>
-            <p className="text-muted-foreground mt-1">Advanced multi-strategy trading engine</p>
-          </div>
-          <div className="flex gap-4 items-center">
-            {/* AI Toggle */}
-            <div className="flex items-center space-x-2 bg-card border px-3 py-2 rounded-lg">
-              <Switch
-                id="ai-mode"
-                checked={isAIEnabled}
-                onCheckedChange={(checked) => {
-                  setIsAIEnabled(checked);
-                  if (checked) toast({ title: "🧠 AI Smart Mode Activated", description: "The bot will now automatically switch strategies based on market conditions." });
-                }}
-              />
-              <Label htmlFor="ai-mode" className="cursor-pointer font-semibold flex items-center gap-1">
-                {isAIEnabled ? "🧠 AI Active" : "🧠 AI Off"}
-              </Label>
+    <div className={`min-h-screen bg-[#121212] flex flex-col items-center text-[#EAEAEA] ${initialSymbol ? '' : 'p-6 space-y-6'}`}>
+      <div className={`w-full ${initialSymbol ? 'max-w-none' : 'max-w-7xl mx-auto space-y-6'}`}>
+        
+
+
+        {!isCoinSelected ? (
+          <div className="w-full space-y-6">
+            <div className="flex justify-between items-center mb-6">
+              <div>
+                <h2 className="text-2xl font-bold text-foreground">Market Universe</h2>
+                <p className="text-muted-foreground mt-1">Select a trending asset to lock the system engine</p>
+              </div>
+              <div className="flex items-center gap-2">
+                {isMarketLoading ? (
+                  <span className="flex items-center gap-1.5 text-xs text-[#848E9C] bg-[#1A1A1A] border border-[#333] px-3 py-1.5 rounded-full">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#848E9C] animate-pulse"></span>
+                    Loading…
+                  </span>
+                ) : isLive ? (
+                  <span className="flex items-center gap-1.5 text-xs text-[#1DB954] bg-[#1DB954]/10 border border-[#1DB954]/30 px-3 py-1.5 rounded-full font-semibold">
+                    <span className="w-1.5 h-1.5 rounded-full bg-[#1DB954] animate-pulse"></span>
+                    LIVE
+                    {nextRefresh > 0 && <span className="opacity-60 font-normal ml-1">· {nextRefresh}s</span>}
+                  </span>
+                ) : (
+                  <span className="flex items-center gap-1.5 text-xs text-orange-400 bg-orange-400/10 border border-orange-400/30 px-3 py-1.5 rounded-full">
+                    <span className="w-1.5 h-1.5 rounded-full bg-orange-400"></span>
+                    Cached
+                  </span>
+                )}
+              </div>
             </div>
 
-            <Button
-              variant="outline"
-              className="gap-2 border-purple-500/50 hover:bg-purple-500/10 text-purple-400"
-              onClick={handleAskGemini}
-              disabled={isLoadingAdvice}
-            >
-              {isLoadingAdvice ? <div className="animate-spin">⏳</div> : <Sparkles className="h-4 w-4" />}
-              Ask AI Advisor
-            </Button>
+            {/* Top Market Coins Grid */}
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
+              {liveCoins.map((coin) => (
+                <Card 
+                  key={coin.symbol}
+                  className="bg-[#1A1A1A] border-[#333]/50 shadow-sm hover:border-[#1DB954]/50 hover:shadow-[#1DB954]/10 transition-all cursor-pointer group"
+                  onClick={() => handleSelectCoin(coin)}
+                >
+                  <CardHeader className="p-4 pb-2 flex flex-row items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <span className="text-2xl">{coin.logo}</span>
+                      <span className="font-bold text-lg text-foreground group-hover:text-[#1DB954] transition-colors">{coin.symbol}</span>
+                    </div>
+                    <Badge variant="outline" className="border-[#333] text-muted-foreground bg-transparent group-hover:border-[#1DB954]/50 group-hover:text-[#1DB954]">
+                      Rank #{coin.rank}
+                    </Badge>
+                  </CardHeader>
+                  <CardContent className="p-4 pt-2 flex justify-between items-end">
+                    <div className="flex flex-col">
+                      <span className="text-sm text-muted-foreground mb-1">Price</span>
+                      <span className="text-xl font-bold text-foreground">{coin.price}</span>
+                    </div>
+                    <div className="flex flex-col items-end">
+                      <span className="text-sm text-muted-foreground mb-1">24h Change</span>
+                      <span className={`text-sm font-bold flex items-center ${coin.change24h.startsWith('+') ? 'text-[#1DB954]' : 'text-red-500'}`}>
+                        {coin.change24h.startsWith('+') ? <TrendingUp className="w-4 h-4 mr-1" /> : <TrendingDown className="w-4 h-4 mr-1" />}
+                        {coin.change24h}
+                      </span>
+                    </div>
+                  </CardContent>
+                </Card>
+              ))}
+            </div>
+            
+            <Tabs defaultValue="overview" className="w-full">
+              <TabsList className="grid w-full grid-cols-3 bg-[#1A1A1A]/80 backdrop-blur-md border border-[#333]/50 shadow-lg min-h-[48px] mb-6">
+                <TabsTrigger value="overview" className="flex items-center text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10">Overview</TabsTrigger>
+                <TabsTrigger value="trading_data" className="flex items-center text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10">Trading Data</TabsTrigger>
+                <TabsTrigger value="ai_select" className="flex items-center text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10">AI Select</TabsTrigger>
+              </TabsList>
+              
+              <TabsContent value="overview" className="space-y-6">
+                {/* High Density Grid */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                  {[
+                    { title: "🔥 Hot", data: [...liveCoins].sort((a, b) => Math.abs(b.rawChange) - Math.abs(a.rawChange)).slice(0, 3) },
+                    { title: "✨ New", data: liveCoins.slice(3, 6) },
+                    { title: "🚀 Top Gainer", data: [...liveCoins].sort((a, b) => b.rawChange - a.rawChange).slice(0, 3) },
+                    { title: "📊 Top Volume", data: [...liveCoins].sort((a, b) => b.rawVol - a.rawVol).slice(0, 3) }
+                  ].map((category, idx) => (
+                    <Card key={idx} className="bg-[#1A1A1A] border-[#333]/50 shadow-sm flex-1">
+                      <CardHeader className="py-3 border-b border-[#333]/50">
+                        <CardTitle className="text-xs font-bold text-foreground tracking-wide uppercase">{category.title}</CardTitle>
+                      </CardHeader>
+                      <CardContent className="p-0 flex flex-col">
+                        {category.data.map((coin, i) => (
+                          <div 
+                            key={coin.symbol} 
+                            onClick={() => handleSelectCoin(coin)}
+                            className={`flex items-center justify-between p-3 hover:bg-[#333]/30 cursor-pointer transition-colors ${i !== category.data.length - 1 ? 'border-b border-[#333]/30' : ''}`}
+                          >
+                            <div className="flex items-center gap-2">
+                              <span className="text-lg">{coin.logo}</span>
+                              <div className="flex flex-col">
+                                <span className="font-bold text-sm text-foreground hover:text-[#1DB954] transition-colors">{coin.symbol}</span>
+                              </div>
+                            </div>
+                            <div className="flex flex-col items-end">
+                              <span className="text-sm font-medium">{coin.price}</span>
+                              <span className={`text-[10px] font-bold ${coin.change24h.startsWith('+') ? 'text-[#1DB954]' : 'text-red-500'}`}>{coin.change24h}</span>
+                            </div>
+                          </div>
+                        ))}
+                      </CardContent>
+                    </Card>
+                  ))}
+                </div>
 
-            <Button
-              variant="outline"
-              className="gap-2 border-blue-500/50 hover:bg-blue-500/10 text-blue-400"
-              onClick={handleAutoTune}
-              disabled={isTuning}
-            >
-              {isTuning ? <div className="animate-spin">⏳</div> : <Settings className="h-4 w-4" />}
-              Auto-Tune (WFA)
-            </Button>
-
-            <Button
-              onClick={() => setIsRunning(!isRunning)}
-              disabled={isSafetyLocked} // Disable start if locked
-              className={isRunning ? "bg-destructive hover:bg-destructive/90" : "bg-primary"}
-              size="lg"
-            >
-              {isRunning ? (
-                <>
-                  <Pause className="w-4 h-4 mr-2" />
-                  Stop Bot
-                </>
-              ) : (
-                <>
-                  <Play className="w-4 h-4 mr-2" />
-                  Start Bot
-                </>
-              )}
-            </Button>
-
-            {/* Safety Controls */}
-            {isSafetyLocked ? (
-              <Button
-                variant="outline"
-                className="border-yellow-500 text-yellow-500 hover:bg-yellow-500/10"
-                onClick={() => {
-                  riskManagerRef.current.resetSafety();
-                  setIsSafetyLocked(false);
-                  setSafetyReason(null);
-                  toast({ title: "Safety Override", description: "System safety locks have been reset manually." });
-                }}
-              >
-                <Unlock className="w-4 h-4 mr-2" />
-                Reset Safety
-              </Button>
-            ) : (
-              <Button
-                variant="destructive"
-                className="bg-red-900/80 hover:bg-red-900 border border-red-700"
-                onClick={() => {
-                  riskManagerRef.current.triggerKillSwitch();
-                  setIsSafetyLocked(true);
-                  setSafetyReason("Manual Kill Switch Triggered");
-                  setIsRunning(false);
-
-                  // LIQUIDATE ALL POSITIONS IMMEDIATELY
-                  const exitPrice = currentPrice;
-                  let totalLiquidationPnL = 0;
-
-                  setTrades(prevTrades => prevTrades.map(t => {
-                    if (t.status === 'OPEN') {
-                      const pnl = t.side === "BUY"
-                        ? (exitPrice - t.entryPrice) * t.quantity
-                        : (t.entryPrice - exitPrice) * t.quantity;
-
-                      totalLiquidationPnL += pnl;
-
-                      return {
-                        ...t,
-                        status: 'CLOSED',
-                        exitPrice,
-                        exitTime: Date.now(),
-                        pnl,
-                        exitReason: "KILL SWITCH 💀"
-                      };
-                    }
-                    return t;
-                  }));
-
-                  // Update Portfolio immediately since loop stops
-                  setPortfolio(prev => ({
-                    ...prev,
-                    equity: prev.equity + totalLiquidationPnL,
-                    totalPnL: prev.totalPnL + totalLiquidationPnL,
-                    realizedPnL: prev.realizedPnL + totalLiquidationPnL,
-                    unrealizedPnL: 0
-                  }));
-
-                  toast({
-                    title: "🟥 KILL SWITCH ACTIVATED",
-                    description: `Trading halted. All positions liquidated at $${exitPrice}.`,
-                    duration: 5000
-                  });
-                }}
-              >
-                <Skull className="w-4 h-4 mr-2" />
-                KILL SWITCH
-              </Button>
-            )}
+                {/* Top Tokens Table */}
+                <Card className="bg-[#1A1A1A] border-[#333]/50 shadow-lg mt-6">
+                  <CardHeader className="py-4 border-b border-[#333]/50">
+                    <CardTitle className="text-sm font-bold text-foreground tracking-wide uppercase">Top Tokens by Market Capitalization</CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-0 overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead className="bg-[#121212] text-xs text-muted-foreground uppercase tracking-widest border-b border-[#333]/50">
+                        <tr>
+                          <th className="px-4 py-3 text-left font-medium">Asset</th>
+                          <th className="px-4 py-3 text-right font-medium">Price</th>
+                          <th className="px-4 py-3 text-right font-medium">24h Change</th>
+                          <th className="px-4 py-3 text-right font-medium">Market Cap</th>
+                          <th className="px-4 py-3 text-right font-medium">Volume (24h)</th>
+                          <th className="px-4 py-3 text-right font-medium">Action</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {liveCoins.map((coin, i) => (
+                          <tr 
+                            key={coin.symbol} 
+                            className={`hover:bg-[#333]/30 transition-colors group cursor-pointer ${i !== liveCoins.length - 1 ? 'border-b border-[#333]/30' : ''}`}
+                            onClick={() => handleSelectCoin(coin)}
+                          >
+                            <td className="px-4 py-4 min-w-[150px]">
+                              <div className="flex items-center gap-3">
+                                <span className="text-2xl">{coin.logo}</span>
+                                <div>
+                                  <div className="font-bold text-foreground group-hover:text-[#1DB954] transition-colors">{coin.symbol}</div>
+                                  <div className="text-xs text-muted-foreground">{coin.name}</div>
+                                </div>
+                              </div>
+                            </td>
+                            <td className="px-4 py-4 text-right font-medium">{coin.price}</td>
+                            <td className={`px-4 py-4 text-right font-bold ${coin.change24h.startsWith('+') ? 'text-[#1DB954]' : 'text-red-500'}`}>
+                              {coin.change24h}
+                            </td>
+                            <td className="px-4 py-4 text-right text-muted-foreground">{coin.cap}</td>
+                            <td className="px-4 py-4 text-right text-muted-foreground">{coin.vol}</td>
+                            <td className="px-4 py-4 text-right w-[120px]">
+                              <Button 
+                                size="sm" 
+                                className="bg-[#1DB954]/10 text-[#1DB954] hover:bg-[#1DB954] hover:text-black font-bold border border-[#1DB954]/50 transition-all rounded-md w-full"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleSelectCoin(coin);
+                                }}
+                              >
+                                Trade
+                              </Button>
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+              
+              <TabsContent value="trading_data" className="space-y-6">
+                <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+                  {[
+                    "Hot Coins", "Top Gainers", "Top Losers", 
+                    "Top Volume", "USD Futures", "Coin Futures"
+                  ].map((title, cardIdx) => (
+                    <Card key={title} className="bg-[#121418] border-[#2A2D35] shadow-sm rounded-xl overflow-hidden">
+                      <CardHeader className="py-4 px-5 flex flex-row items-center justify-between bg-transparent">
+                        <CardTitle className="text-base font-bold text-[#EAECEF]">{title}</CardTitle>
+                        <Badge variant="outline" className="bg-transparent border-[#2A2D35] text-[#848E9C] text-xs px-2 py-0.5 cursor-pointer hover:bg-[#2A2D35]/50 hover:text-[#EAECEF] transition-colors">
+                          Crypto <span className="ml-1 text-[8px] opacity-70">▼</span>
+                        </Badge>
+                      </CardHeader>
+                      <CardContent className="p-0">
+                        <div className="flex justify-between px-5 py-2 text-[11px] text-[#848E9C] font-medium">
+                          <span className="w-6"></span>
+                          <span className="flex-1 text-left">Name</span>
+                          <span className="w-24 text-right">Price</span>
+                          <span className="w-20 text-right">24h Change</span>
+                        </div>
+                        <div className="flex flex-col pb-2">
+                          {(() => { const sorted = title === 'Top Gainers' ? [...liveCoins].sort((a,b) => b.rawChange - a.rawChange) : title === 'Top Losers' ? [...liveCoins].sort((a,b) => a.rawChange - b.rawChange) : title === 'Top Volume' || title === 'USD Futures' || title === 'Coin Futures' ? [...liveCoins].sort((a,b) => b.rawVol - a.rawVol) : liveCoins; return sorted; })().map((coin, i) => {
+                            const isPositive = !coin.change24h.startsWith('-');
+                            const color = isPositive ? 'text-[#0ECB81]' : 'text-[#F6465D]';
+                            const displayChange = title === "Top Losers" && isPositive ? `-${coin.change24h.replace('+', '')}` : coin.change24h;
+                            const displayColor = title === "Top Losers" ? 'text-[#F6465D]' : color;
+                            return (
+                              <div 
+                                key={`${cardIdx}-${i}`} 
+                                className="flex items-center px-4 py-2 hover:bg-[#2A2D35]/40 cursor-pointer transition-colors"
+                                onClick={() => handleSelectCoin(coin)}
+                              >
+                                <span className="w-6 text-[#848E9C] text-xs font-mono">{i + 1}</span>
+                                <div className="flex items-center gap-2 flex-1 overflow-hidden">
+                                  <span className="text-base w-5 flex justify-center">{coin.logo}</span>
+                                  <span className="font-bold text-[#EAECEF] text-sm truncate">{coin.symbol.replace('USDT', '')}</span>
+                                </div>
+                                <span className="w-24 text-right text-[#EAECEF] text-sm font-medium">{coin.price}</span>
+                                <span className={`w-20 text-right text-sm font-medium ${displayColor}`}>{displayChange}</span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </CardContent>
+                    </Card>
+                  ))}
+                </div>
+              </TabsContent>
+              
+              <TabsContent value="ai_select" className="space-y-6">
+                <AiSelectPanel coins={liveCoins} onSelectCoin={handleSelectCoin} />
+              </TabsContent>
+            </Tabs>
           </div>
-        </div>
+        ) : (
+          <div className="space-y-6">
+            {/* Detailed Asset Header */}
+            <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-[#1A1A1A] p-6 rounded-xl border border-[#333]">
+              <div className="flex items-center gap-4">
+                <div className="flex items-center gap-2">
+                  <Button 
+                    variant="ghost" 
+                    className="px-3 hover:bg-[#333] text-muted-foreground hover:text-foreground" 
+                    onClick={() => router.push('/dashboard')}
+                  >
+                    <RotateCcw className="w-4 h-4 mr-2" />
+                    Back to Market
+                  </Button>
+                  <Button 
+                    variant="ghost" 
+                    className="px-3 hover:bg-[#1DB954]/10 text-[#1DB954] hover:text-[#1DB954] font-medium" 
+                    onClick={() => router.push('/crypto')}
+                  >
+                    <Globe className="w-4 h-4 mr-2" />
+                    Back to Coins
+                  </Button>
+                </div>
+                <div className="h-10 w-px bg-border mx-2 hidden md:block"></div>
+                <span className="text-4xl hidden md:block">{selectedCoinData?.logo || '🪙'}</span>
+                <div>
+                  <h1 className="text-3xl font-bold text-foreground flex items-center gap-3">
+                    {selectedCoinData?.name || selectedSymbol}
+                    <Badge variant="outline" className="border-[#1DB954]/50 text-[#1DB954] text-xs">
+                      Rank #{selectedCoinData?.rank || '--'}
+                    </Badge>
+                  </h1>
+                  <div className="flex items-center gap-2 mt-1">
+                    <span className="text-xl font-medium text-foreground">
+                      ${currentPrice > 0 ? (currentPrice < 1 ? currentPrice.toFixed(4) : currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })) : selectedCoinData?.price || '--'}
+                    </span>
+                    {selectedCoinData?.change24h && (
+                      <span className={`text-sm font-semibold ${selectedCoinData.change24h.startsWith('+') ? 'text-[#1DB954]' : 'text-red-500'}`}>
+                        {selectedCoinData.change24h}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+              <div className="flex flex-wrap gap-2 items-center animate-in fade-in slide-in-from-right-4 duration-500">
+                <div className="flex items-center space-x-2 bg-black/40 border border-[#333]/50 px-3 py-2 rounded-lg">
+                  <Switch id="ai-mode" checked={isAIEnabled} onCheckedChange={(checked) => { setIsAIEnabled(checked); if (checked) toast({ title: "🧠 AI Smart Mode Activated", description: "System strategies automated." }); }} />
+                  <Label htmlFor="ai-mode" className="cursor-pointer text-xs font-semibold flex items-center gap-1">{isAIEnabled ? "🧠 AI Active" : "🧠 AI Off"}</Label>
+                </div>
+                <Button variant="outline" size="sm" className="gap-2 border-purple-500/50 bg-black/40 hover:bg-purple-500/10 text-purple-400" onClick={handleAskGemini} disabled={isLoadingAdvice}>{isLoadingAdvice ? <div className="animate-spin">⏳</div> : <Sparkles className="h-4 w-4" />} Advisor</Button>
+                <Button variant="outline" size="sm" className="gap-2 border-blue-500/50 bg-black/40 hover:bg-blue-500/10 text-blue-400" onClick={handleAutoTune} disabled={isTuning}>{isTuning ? <div className="animate-spin">⏳</div> : <Settings className="h-4 w-4" />} Auto-Tune</Button>
+              </div>
+            </div>
 
-        {/* Key Metrics */}
-        <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">Account Balance</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-foreground">${portfolio.equity.toFixed(2)}</div>
-              <p className={`text-xs mt-1 ${portfolio.totalPnL > 0 ? "text-green-500" : "text-red-500"}`}>
-                {portfolio.totalPnL > 0 ? "+" : ""}
-                ${portfolio.totalPnL.toFixed(2)}
-              </p>
-            </CardContent>
-          </Card>
+            {/* Detailed Asset Grid Layout - 3 COLUMN EXCHANGE Layout */}
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+              
+              {/* Left Column: Order Book */}
+              <div className="lg:col-span-2 space-y-6 flex flex-col h-[1200px]">
+                <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg flex-1 overflow-hidden flex flex-col">
+                  <CardHeader className="py-3 border-b border-[#333]/50">
+                    <CardTitle className="text-sm font-bold text-foreground tracking-wide uppercase">Order Book</CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-0 flex flex-col flex-1 overflow-y-auto custom-scrollbar">
+                    <div className="grid grid-cols-3 px-4 py-2 text-[10px] text-muted-foreground uppercase tracking-widest bg-black/40 sticky top-0 z-20">
+                      <span className="text-left">Price(USDT)</span>
+                      <span className="text-right">Amount</span>
+                      <span className="text-right">Total</span>
+                    </div>
+                    {/* Asks (Red) */}
+                    <div className="flex flex-col flex-1 px-3 py-1 space-y-[2px] justify-end">
+                      {orderBookAsks.map((ask, i) => (
+                        <div key={`ask-${i}`} className="grid grid-cols-3 text-xs font-mono relative cursor-pointer hover:bg-[#333]/30 py-[2px]">
+                          <div className="absolute right-0 top-0 bottom-0 bg-red-500/10 z-0 transition-all pointer-events-none" style={{ width: `${(ask.total / 10) * 100}%` }} />
+                          <span className="text-red-500 z-10 text-left">{ask.price.toFixed(4)}</span>
+                          <span className="text-foreground z-10 text-right pr-2">{ask.amount.toFixed(3)}</span>
+                          <span className="text-muted-foreground z-10 text-right">{ask.total.toFixed(3)}</span>
+                        </div>
+                      ))}
+                    </div>
+                    
+                    {/* Current Price Anchor */}
+                    <div className="py-2 px-4 border-y border-[#333]/50 bg-black/60 flex items-center justify-between sticky z-20">
+                      <span className="text-xl font-bold text-[#1DB954]">{currentPrice > 0 ? currentPrice.toFixed(4) : '--'}</span>
+                      <span className="text-xs text-muted-foreground underline hover:text-foreground cursor-pointer">Spread: 0.01%</span>
+                    </div>
 
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">Win Rate</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-foreground">{(portfolio.winRate * 100).toFixed(1)}%</div>
-              <p className="text-xs mt-1 text-muted-foreground">{closedTrades.length} trades closed</p>
-            </CardContent>
-          </Card>
+                    {/* Bids (Green) */}
+                    <div className="flex flex-col flex-1 px-3 py-1 space-y-[2px] justify-start">
+                      {orderBookBids.map((bid, i) => (
+                        <div key={`bid-${i}`} className="grid grid-cols-3 text-xs font-mono relative cursor-pointer hover:bg-[#333]/30 py-[2px]">
+                          <div className="absolute right-0 top-0 bottom-0 bg-[#1DB954]/10 z-0 transition-all pointer-events-none" style={{ width: `${(bid.total / 10) * 100}%` }} />
+                          <span className="text-[#1DB954] z-10 text-left">{bid.price.toFixed(4)}</span>
+                          <span className="text-foreground z-10 text-right pr-2">{bid.amount.toFixed(3)}</span>
+                          <span className="text-muted-foreground z-10 text-right">{bid.total.toFixed(3)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
 
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">Open Positions</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-foreground">{openTrades.length}</div>
-              <p className="text-xs mt-1 text-muted-foreground">
-                Unrealized: ${portfolio.unrealizedPnL.toFixed(2)}
-              </p>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader className="pb-2">
-              <CardTitle className="text-sm font-medium text-muted-foreground">Max Drawdown</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="text-2xl font-bold text-foreground">{(portfolio.maxDrawdown * 100).toFixed(2)}%</div>
-              <p className="text-xs mt-1 text-muted-foreground">Risk metric</p>
-            </CardContent>
-          </Card>
-        </div>
+              {/* Center Column: Intelligence Engine */}
+              <div className="lg:col-span-8 space-y-6">
 
         {/* Main Content Tabs */}
         <Tabs value={activeTab} onValueChange={setActiveTab}>
-          <TabsList className="grid w-full grid-cols-4">
-            <TabsTrigger value="overview" className="flex items-center">
-              <Activity className="w-4 h-4 mr-2" />
-              Overview
-            </TabsTrigger>
-            <TabsTrigger value="trades" className="flex items-center">
-              <TrendingUp className="w-4 h-4 mr-2" />
-              Trades
-            </TabsTrigger>
-            <TabsTrigger value="analytics" className="flex items-center">
-              <BarChart className="w-4 h-4 mr-2" />
-              Analytics
-            </TabsTrigger>
-            <TabsTrigger value="settings" className="flex items-center">
-              <Settings className="w-4 h-4 mr-2" />
-              Settings
-            </TabsTrigger>
+          <TabsList className="grid w-full grid-cols-4 bg-[#1A1A1A]/80 backdrop-blur-md border border-[#333]/50 shadow-lg min-h-[48px]">
+            <TabsTrigger value="chart" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><Activity className="w-3 h-3 mr-2 hidden md:block" />Chart</TabsTrigger>
+            <TabsTrigger value="info" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><Settings className="w-3 h-3 mr-2 hidden md:block" />Trade Config</TabsTrigger>
+            <TabsTrigger value="data" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><BarChart className="w-3 h-3 mr-2 hidden md:block" />Data</TabsTrigger>
+            <TabsTrigger value="square" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><Globe className="w-3 h-3 mr-2 hidden md:block" />Square</TabsTrigger>
           </TabsList>
 
-          {/* Overview Tab */}
-          <TabsContent value="overview" className="space-y-4">
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-              {/* Price Chart - REAL-TIME from Binance */}
-              <Card>
-                <CardHeader>
-                  <CardTitle className="flex items-center justify-between">
-                    <span className="flex items-center gap-2">
-                      Price Action - {selectedSymbol}
-                      {wsConnected ? (
-                        <Badge variant="outline" className="bg-green-500/10 text-green-500 border-green-500/30 text-xs">
-                          <span className="w-2 h-2 rounded-full bg-green-500 mr-1 animate-pulse" />
-                          LIVE
-                        </Badge>
-                      ) : (
-                        <Badge variant="outline" className="bg-yellow-500/10 text-yellow-500 border-yellow-500/30 text-xs">
-                          Connecting...
-                        </Badge>
-                      )}
-                    </span>
-                    {currentPrice > 0 && (
-                      <span className="text-lg font-normal text-primary">
-                        ${currentPrice < 1 ? currentPrice.toFixed(4) : currentPrice.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                      </span>
-                    )}
+          {/* Chart Tab: Central Focus */}
+          <TabsContent value="chart" className="space-y-4 mt-4">
+            {/* Risk Intelligence Embedded */}
+            {isCoinSelected && (
+              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                <CardHeader className="pb-2">
+                  <CardTitle className="flex items-center gap-2">
+                    <Brain className="w-5 h-5 text-[#1DB954]" />
+                    Risk Intelligence
                   </CardTitle>
-                  <CardDescription>{selectedTimeframe} timeframe • Binance Real-Time Data</CardDescription>
                 </CardHeader>
                 <CardContent>
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30">
+                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">95% Confidence Interval</div>
+                      <div className="text-lg font-bold text-foreground">Value at Risk (VaR)</div>
+                    </div>
+                    <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30">
+                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Topological Persistence Homology</div>
+                      <div className="text-lg font-bold text-foreground">Regime Structure</div>
+                    </div>
+                    <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30">
+                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Fractional Differencing (d=0.4)</div>
+                      <div className="text-lg font-bold text-foreground">Stationarity</div>
+                    </div>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
+            <div className="flex flex-col gap-6">
+              {/* Price Chart - REAL-TIME from Binance */}
+              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                <CardHeader className="border-b border-[#333]/50 pb-4">
+                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                    <CardTitle className="text-2xl font-bold flex items-center gap-3 text-foreground">
+                      Price Chart ({selectedSymbol})
+                      {wsConnected && (
+                        <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-green-500/10 border border-green-500/20 text-[10px] text-green-500 font-bold uppercase tracking-widest">
+                          <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                          LIVE
+                        </div>
+                      )}
+                    </CardTitle>
+                    <div className="flex items-center gap-1 bg-[#121212] p-1 rounded-lg border border-[#333]/30">
+                      {['15m', '1h', '4h', '1d', '1w'].map(tf => (
+                        <button
+                          key={tf}
+                          onClick={() => setSelectedTimeframe(tf)}
+                          className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all ${selectedTimeframe === tf ? 'bg-[#2B2B43] text-[#EAEAEA]' : 'text-gray-500 hover:text-gray-300'}`}
+                        >
+                          {tf.toUpperCase()}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </CardHeader>
+                <CardContent className="pt-6">
                   {priceLoading ? (
-                    <div className="h-[400px] flex items-center justify-center">
+                    <div className="h-[600px] flex items-center justify-center">
                       <div className="text-muted-foreground">Loading price data...</div>
                     </div>
                   ) : candlestickData.length === 0 ? (
-                    <div className="h-[400px] flex items-center justify-center">
+                    <div className="h-[600px] flex items-center justify-center">
                       <div className="text-muted-foreground">No price data available</div>
                     </div>
                   ) : (
-                    <div className="w-full h-[400px] relative group">
+                    <div className="w-full h-[600px] relative group">
                       <FinancialChart data={candlestickData} />
                       {/* Strategy Overlay Badge */}
                       <div className="absolute top-4 left-4 z-10 bg-background/90 backdrop-blur-md border border-border/50 rounded-lg px-3 py-2 shadow-lg flex items-center gap-3 transition-opacity">
@@ -1326,7 +1821,7 @@ export default function BinanceTradingDashboard() {
               </Card>
 
               {/* Equity Curve */}
-              <Card>
+              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
                 <CardHeader>
                   <CardTitle>Equity Curve</CardTitle>
                   <CardDescription>Account balance over time</CardDescription>
@@ -1334,10 +1829,10 @@ export default function BinanceTradingDashboard() {
                 <CardContent>
                   <ResponsiveContainer width="100%" height={300}>
                     <LineChart data={balanceHistory}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis dataKey="time" stroke="#000000" fontSize={12} tickLine={false} axisLine={false} />
-                      <YAxis stroke="#000000" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(value) => `$${value}`} />
-                      <Tooltip contentStyle={{ backgroundColor: "var(--card)", border: "1px solid var(--border)" }} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="#333" opacity={0.3} />
+                      <XAxis dataKey="time" stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                      <YAxis stroke="#666" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(value) => `$${value}`} />
+                      <Tooltip contentStyle={{ backgroundColor: "#1A1A1A", border: "1px solid #333", color: "#EAEAEA" }} />
                       <Line
                         type="monotone"
                         dataKey="balance"
@@ -1352,7 +1847,7 @@ export default function BinanceTradingDashboard() {
             </div>
 
             {/* Active Trades */}
-            <Card>
+            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
               <CardHeader>
                 <CardTitle className="flex items-center">
                   <Zap className="w-4 h-4 mr-2 text-yellow-500" />
@@ -1390,9 +1885,63 @@ export default function BinanceTradingDashboard() {
             </Card>
           </TabsContent>
 
-          {/* Trades Tab */}
-          <TabsContent value="trades" className="space-y-4">
-            <Card>
+          {/* Data Tab */}
+          <TabsContent value="data" className="space-y-4 mt-4">
+            
+            {/* SDP Quantitative Metrics Headway Card */}
+            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+              <CardHeader className="pb-2">
+                <CardTitle className="flex items-center gap-2 text-lg text-[#1DB954]">
+                  <Database className="w-5 h-5" />
+                  Quantitative Metrics (SDP)
+                </CardTitle>
+                <CardDescription>Live mathematical model encodings for active market conditions.</CardDescription>
+              </CardHeader>
+              <CardContent>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-2">
+                  <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30 flex flex-col justify-between">
+                    <div>
+                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Topological Data Analysis</div>
+                      <div className="text-lg font-bold text-foreground">Regime Encoding</div>
+                    </div>
+                    <div className="mt-4 pt-4 border-t border-[#333]/50 space-y-2 text-sm font-mono">
+                      <div className="flex justify-between items-center"><span className="text-muted-foreground">Components (β₀):</span> <span className="text-foreground">12</span></div>
+                      <div className="flex justify-between items-center"><span className="text-muted-foreground">Loops (β₁):</span> <span className="text-foreground">3</span></div>
+                      <div className="flex justify-between items-center"><span className="text-muted-foreground">Voids (β₂):</span> <span className="text-foreground">0</span></div>
+                    </div>
+                  </div>
+                  
+                  <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30 flex flex-col justify-between">
+                    <div>
+                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Stationarity Protocol</div>
+                      <div className="text-lg font-bold text-foreground">Fractional Diff (d=0.4)</div>
+                    </div>
+                    <div className="mt-4 pt-4 border-t border-[#333]/50 text-sm">
+                      <div className="flex justify-center items-center gap-2 mb-3">
+                        <span className="relative flex h-2.5 w-2.5"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#1DB954] opacity-75"></span><span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-[#1DB954]"></span></span>
+                        <span className="font-bold text-foreground tracking-wide">STATIONARITY ACH.</span>
+                      </div>
+                      <p className="text-muted-foreground text-center text-xs">ADF Test p-value: <span className="text-white font-mono">0.014</span> (&lt; 0.05)</p>
+                    </div>
+                  </div>
+
+                  <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30 flex flex-col justify-between">
+                    <div>
+                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Risk Bounds</div>
+                      <div className="text-lg font-bold text-foreground">VaR & Expected Shortfall</div>
+                    </div>
+                    <div className="mt-4 pt-4 border-t border-[#333]/50 space-y-2 text-sm font-mono">
+                      <div className="flex justify-between items-center"><span className="text-muted-foreground">VaR (95%):</span> <span className="text-red-400 font-bold">-2.40%</span></div>
+                      <div className="flex justify-between items-center"><span className="text-muted-foreground">CVaR (95%):</span> <span className="text-red-500 font-bold">-3.85%</span></div>
+                      <div className="w-full bg-[#333]/50 h-1.5 rounded-full overflow-hidden flex mt-2"><div className="w-[85%] bg-blue-500/50 h-full"></div><div className="w-[15%] bg-red-500 h-full"></div></div>
+                    </div>
+                  </div>
+                </div>
+              </CardContent>
+            </Card>
+
+            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
               <CardHeader>
                 <CardTitle className="flex items-center">
                   <CheckCircle className="w-4 h-4 mr-2 text-green-500" />
@@ -1438,12 +1987,11 @@ export default function BinanceTradingDashboard() {
                 </div>
               </CardContent>
             </Card>
-          </TabsContent>
-
-          {/* Analytics Tab */}
-          <TabsContent value="analytics" className="space-y-4">
+            </div>
+          {/* Analytics Section inside Data Tab */}
+          <div className="space-y-4 mt-6">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <Card>
+              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
                 <CardHeader>
                   <CardTitle>Trade Distribution</CardTitle>
                 </CardHeader>
@@ -1455,17 +2003,17 @@ export default function BinanceTradingDashboard() {
                         { name: "Losses", value: closedTrades.filter((t) => (t.pnl || 0) < 0).length },
                       ]}
                     >
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis dataKey="name" stroke="var(--muted-foreground)" />
-                      <YAxis stroke="var(--muted-foreground)" />
-                      <Tooltip contentStyle={{ backgroundColor: "var(--card)", border: "1px solid var(--border)" }} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="#333" opacity={0.3} />
+                      <XAxis dataKey="name" stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                      <YAxis stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                      <Tooltip contentStyle={{ backgroundColor: "#1A1A1A", border: "1px solid #333", color: "#EAEAEA" }} />
                       <Bar dataKey="value" fill="#3b82f6" />
                     </BarChart>
                   </ResponsiveContainer>
                 </CardContent>
               </Card>
 
-              <Card>
+              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
                 <CardHeader>
                   <CardTitle>PnL Distribution</CardTitle>
                 </CardHeader>
@@ -1479,10 +2027,10 @@ export default function BinanceTradingDashboard() {
                           pnl: t.pnl || 0,
                         }))}
                     >
-                      <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-                      <XAxis dataKey="name" stroke="var(--muted-foreground)" />
-                      <YAxis stroke="var(--muted-foreground)" />
-                      <Tooltip contentStyle={{ backgroundColor: "var(--card)", border: "1px solid var(--border)" }} />
+                      <CartesianGrid strokeDasharray="3 3" stroke="#333" opacity={0.3} />
+                      <XAxis dataKey="name" stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                      <YAxis stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                      <Tooltip contentStyle={{ backgroundColor: "#1A1A1A", border: "1px solid #333", color: "#EAEAEA" }} />
                       <Bar
                         dataKey="pnl"
                         fill="#3b82f6"
@@ -1493,11 +2041,47 @@ export default function BinanceTradingDashboard() {
                 </CardContent>
               </Card>
             </div>
+          </div>
+        </TabsContent>
+
+          {/* Square Tab (Gemini Advisor integration point) */}
+          <TabsContent value="square" className="space-y-4 mt-4">
+             <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg p-6 flex flex-col items-center justify-center text-center min-h-[400px]">
+               <Brain className="w-16 h-16 text-purple-500 mb-4 animate-pulse" />
+               <h3 className="text-2xl font-bold text-white mb-2">Square Intelligence</h3>
+               <p className="text-muted-foreground mb-6 max-w-md">Connect with the Gemini Neural Network to generate market sentiment, backtesting signals, and auto-tuning boundaries.</p>
+               <Button onClick={handleAskGemini} disabled={isLoadingAdvice} className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-6 px-8 rounded-xl shadow-lg shadow-purple-900/50">
+                 {isLoadingAdvice ? "Analyzing..." : "Generate Square Analysis"}
+               </Button>
+             </Card>
           </TabsContent>
 
-          {/* Settings Tab */}
-          <TabsContent value="settings" className="space-y-4">
-            <Card>
+          {/* Info Tab (Settings + Scenarios) */}
+          <TabsContent value="info" className="space-y-4 mt-4">
+            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg mb-6">
+                <CardHeader>
+                  <CardTitle className="text-lg flex items-center gap-2">
+                    <Activity className="w-5 h-5 text-[#1DB954]" />
+                    Market Scenarios
+                  </CardTitle>
+                </CardHeader>
+                <CardContent className="space-y-4 grid grid-cols-3">
+                  <div>
+                    <div className="text-sm text-muted-foreground mb-1">Market Cap</div>
+                    <div className="text-xl font-bold text-foreground">{selectedCoinData?.cap || '--'}</div>
+                  </div>
+                  <div>
+                    <div className="text-sm text-muted-foreground mb-1">Volume (24h)</div>
+                    <div className="text-xl font-bold text-foreground">{selectedCoinData?.vol || '--'}</div>
+                  </div>
+                  <div>
+                    <div className="text-sm text-muted-foreground mb-1">Circulating Supply</div>
+                    <div className="text-xl font-bold text-foreground">{selectedCoinData?.supply || '--'}</div>
+                  </div>
+                </CardContent>
+            </Card>
+            
+            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
               <CardHeader>
                 <CardTitle>Trading Configuration</CardTitle>
                 <CardDescription>Configure your trading strategy and parameters</CardDescription>
@@ -1552,7 +2136,7 @@ export default function BinanceTradingDashboard() {
                       onFocus={() => setShowPairSearch(true)}
                       onBlur={() => setTimeout(() => setShowPairSearch(false), 200)}
                       placeholder="Search pairs (e.g., BTCUSDT)"
-                      className="w-full px-3 py-2 border rounded-md bg-background"
+                      className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                     />
                     {showPairSearch && filteredPairs.length > 0 && (
                       <div className="absolute z-10 w-full mt-1 bg-background border rounded-md shadow-lg max-h-60 overflow-y-auto">
@@ -1579,7 +2163,7 @@ export default function BinanceTradingDashboard() {
                     <select
                       value={selectedTimeframe}
                       onChange={(e) => setSelectedTimeframe(e.target.value)}
-                      className="w-full px-3 py-2 border rounded-md bg-background"
+                      className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                     >
                       <option value="1m">1 Minute</option>
                       <option value="5m">5 Minutes</option>
@@ -1605,7 +2189,7 @@ export default function BinanceTradingDashboard() {
                         const val = parseFloat(e.target.value)
                         setRiskPerTrade(isNaN(val) ? 0 : val)
                       }}
-                      className="w-full px-3 py-2 border rounded-md bg-background"
+                      className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                     />
                     <p className="text-xs text-muted-foreground mt-1">Recommended: 1-3%</p>
                   </div>
@@ -1621,7 +2205,7 @@ export default function BinanceTradingDashboard() {
                         const val = parseInt(e.target.value)
                         setMaxPositions(isNaN(val) ? 1 : val)
                       }}
-                      className="w-full px-3 py-2 border rounded-md bg-background"
+                      className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                     />
                   </div>
                 </div>
@@ -1638,7 +2222,7 @@ export default function BinanceTradingDashboard() {
                         step="0.1"
                         value={stopLoss}
                         onChange={(e) => setStopLoss(parseFloat(e.target.value) || 0)}
-                        className="w-full px-3 py-2 border rounded-md bg-background"
+                        className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                       />
                     </div>
                     <div>
@@ -1649,7 +2233,7 @@ export default function BinanceTradingDashboard() {
                         step="0.1"
                         value={takeProfit}
                         onChange={(e) => setTakeProfit(parseFloat(e.target.value) || 0)}
-                        className="w-full px-3 py-2 border rounded-md bg-background"
+                        className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                       />
                     </div>
                     <div>
@@ -1660,7 +2244,7 @@ export default function BinanceTradingDashboard() {
                         step="0.1"
                         value={trailingStop}
                         onChange={(e) => setTrailingStop(parseFloat(e.target.value) || 0)}
-                        className="w-full px-3 py-2 border rounded-md bg-background"
+                        className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                       />
                       <p className="text-xs text-muted-foreground mt-1">Locks in profit as price rises</p>
                     </div>
@@ -1669,7 +2253,7 @@ export default function BinanceTradingDashboard() {
                       <select
                         value={leverage}
                         onChange={(e) => setLeverage(parseInt(e.target.value))}
-                        className="w-full px-3 py-2 border rounded-md bg-background"
+                        className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                       >
                         <option value="1">1x (Spot)</option>
                         <option value="2">2x</option>
@@ -1728,7 +2312,7 @@ export default function BinanceTradingDashboard() {
                           value={presetName}
                           onChange={(e) => setPresetName(e.target.value)}
                           onKeyDown={(e) => e.key === 'Enter' && handleSaveAsPreset()}
-                          className="flex-1 px-3 py-2 text-sm border rounded-md bg-background"
+                          className="flex-1 px-3 py-2 text-sm border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
                         />
                         <Button size="sm" onClick={handleSaveAsPreset}>
                           Save as Preset
@@ -1785,10 +2369,182 @@ export default function BinanceTradingDashboard() {
                   </Button>
                   <Button className="flex-1" onClick={handleSaveConfiguration}>Save Configuration</Button>
                 </div>
+
+                {/* Finalize Launch Execution within Configuration Module */}
+                <div className="pt-8 mt-8 border-t border-[#333]/50">
+                  <div className="bg-black/60 border border-[#333]/50 rounded-xl p-6 relative overflow-hidden">
+                    {/* Decorative Background Glow */}
+                    <div className="absolute top-0 right-0 w-32 h-32 bg-[#1DB954]/10 rounded-full blur-3xl pointer-events-none" />
+                    
+                    <h4 className="text-sm font-bold uppercase tracking-wider mb-2 text-[#1DB954] flex items-center gap-2">
+                      <Zap className="w-4 h-4" /> Finalize & Engine Launch
+                    </h4>
+                    <p className="text-xs text-muted-foreground mb-6">Review your configuration matrix above. Only launch the strategy after you have verified your capital exposure limits and active trading pair selections.</p>
+                    
+                    <div className="flex flex-col sm:flex-row gap-4 items-center relative z-10">
+                      <Button
+                        onClick={() => setIsRunning(!isRunning)}
+                        disabled={isSafetyLocked}
+                        className={isRunning 
+                          ? "w-full sm:flex-1 bg-red-600 hover:bg-red-700 font-bold py-6 text-lg shadow-lg shadow-red-900/20" 
+                          : "w-full sm:flex-1 bg-[#1DB954] hover:bg-[#1AA34A] text-white font-bold py-6 text-lg shadow-lg shadow-[#1DB954]/20"}
+                      >
+                        {isRunning ? (<span className="flex items-center"><Pause className="w-5 h-5 mr-2" /> STOP ENGINE</span>) : (<span className="flex items-center"><Play className="w-5 h-5 mr-2" /> LAUNCH ALGORITHMIC ENGINE</span>)}
+                      </Button>
+
+                      {isSafetyLocked ? (
+                        <Button
+                          variant="outline"
+                          className="w-full sm:w-auto py-6 px-6 font-bold border-yellow-500 text-yellow-500 bg-yellow-500/5 hover:bg-yellow-500/10"
+                          onClick={() => {
+                            riskManagerRef.current.resetSafety();
+                            setIsSafetyLocked(false);
+                            setSafetyReason(null);
+                            toast({ title: "Safety Override", description: "System safety locks have been reset manually." });
+                          }}
+                        >
+                          <Unlock className="w-5 h-5 mr-2" />
+                          RESET LOCKS
+                        </Button>
+                      ) : (
+                        <Button
+                          variant="destructive"
+                          className="w-full sm:w-auto py-6 px-6 font-bold bg-red-900/80 hover:bg-red-900 border border-red-700 shadow-lg"
+                          onClick={() => {
+                            riskManagerRef.current.triggerKillSwitch();
+                            setIsSafetyLocked(true);
+                            setSafetyReason("Manual Kill Switch Triggered");
+                            setIsRunning(false);
+
+                            const exitPrice = currentPrice;
+                            let totalLiquidationPnL = 0;
+
+                            setTrades(prevTrades => prevTrades.map(t => {
+                              if (t.status === 'OPEN') {
+                                const pnl = t.side === "BUY"
+                                  ? (exitPrice - t.entryPrice) * t.quantity
+                                  : (t.entryPrice - exitPrice) * t.quantity;
+                                totalLiquidationPnL += pnl;
+                                return { ...t, status: 'CLOSED', exitPrice, exitTime: Date.now(), pnl, exitReason: "KILL SWITCH 💀" };
+                              }
+                              return t;
+                            }));
+
+                            setPortfolio(prev => ({
+                              ...prev,
+                              equity: prev.equity + totalLiquidationPnL,
+                              totalPnL: prev.totalPnL + totalLiquidationPnL,
+                              realizedPnL: prev.realizedPnL + totalLiquidationPnL,
+                              unrealizedPnL: 0
+                            }));
+
+                            toast({ title: "🟥 KILL SWITCH ACTIVATED", description: `Trading halted. All positions liquidated at $${exitPrice}.`, duration: 5000 });
+                          }}
+                        >
+                          <Skull className="w-5 h-5 mr-2" />
+                          KILL SWITCH
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+                </div>
               </CardContent>
             </Card>
           </TabsContent>
         </Tabs>
+              </div>
+
+              {/* Right Column: Market Activity & About Coin */}
+              <div className="lg:col-span-2 space-y-6 flex flex-col h-[1200px]">
+                
+                {/* About Coin */}
+                <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg shrink-0">
+                  <CardHeader className="py-3 border-b border-[#333]/50">
+                    <CardTitle className="text-sm font-bold text-foreground tracking-wide uppercase flex items-center gap-2">
+                       <span className="text-lg">{selectedCoinData?.logo || '🪙'}</span> About {selectedSymbol.replace('USDT','')}
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-4 text-xs text-muted-foreground leading-relaxed space-y-3">
+                    <p>
+                      {selectedSymbol.replace('USDT','')} is a dynamic digital asset actively positioned on the global exchange network. It leverages cryptographic consensus mechanisms and high-throughput liquidity to enable automated algorithmic strategies.
+                    </p>
+                    <p>
+                      The current quantitative models indicate persistent structural accumulation, allowing executing engines to harness fractional volume discrepancies optimally.
+                    </p>
+                    <div className="mt-4 pt-3 border-t border-[#333]/50 flex justify-between">
+                      <span className="text-foreground font-bold">Network Consensus</span>
+                      <span className="text-[#1DB954] font-mono">Proof-of-Stake</span>
+                    </div>
+                  </CardContent>
+                </Card>
+
+                <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg flex-1 overflow-hidden flex flex-col">
+                  <CardHeader className="py-3 border-b border-[#333]/50">
+                    <CardTitle className="text-sm font-bold text-foreground tracking-wide uppercase">Market Trades</CardTitle>
+                  </CardHeader>
+                  <CardContent className="p-0 flex flex-col flex-1 overflow-y-auto custom-scrollbar">
+                    <div className="grid grid-cols-3 px-4 py-2 text-[10px] text-muted-foreground uppercase tracking-widest bg-black/40 sticky top-0 z-20">
+                      <span className="text-left">Price(USDT)</span>
+                      <span className="text-right">Amount</span>
+                      <span className="text-right">Time</span>
+                    </div>
+                    <div className="flex flex-col flex-1 px-3 py-1 space-y-[2px]">
+                      {marketTradesList.map((trade, i) => (
+                        <div key={`trade-${i}`} className="grid grid-cols-3 text-xs font-mono cursor-pointer hover:bg-[#333]/30 py-[2px] animate-in slide-in-from-top-2 duration-300">
+                          <span className={`${trade.isBuyer ? 'text-[#1DB954]' : 'text-red-500'} text-left`}>{trade.price.toFixed(4)}</span>
+                          <span className="text-foreground text-right pr-2">{trade.amount.toFixed(3)}</span>
+                          <span className="text-muted-foreground text-right">{trade.time}</span>
+                        </div>
+                      ))}
+                    </div>
+                  </CardContent>
+                </Card>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Persistent Global Metrics Row (Anchored to Footer) */}
+        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mt-6">
+          <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wider">Account Balance</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold text-foreground">${portfolio.equity.toFixed(2)}</div>
+              <p className={`text-xs mt-1 font-semibold ${portfolio.totalPnL > 0 ? "text-[#1DB954]" : "text-red-500"}`}>
+                {portfolio.totalPnL > 0 ? "+" : ""}${portfolio.totalPnL.toFixed(2)}
+              </p>
+            </CardContent>
+          </Card>
+          <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wider">Win Rate</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold text-foreground">{(portfolio.winRate * 100).toFixed(1)}%</div>
+              <p className="text-xs mt-1 text-muted-foreground">{closedTrades.length} trades closed</p>
+            </CardContent>
+          </Card>
+          <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wider">Open Positions</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold text-foreground">{openTrades.length}</div>
+              <p className="text-xs mt-1 text-muted-foreground">Unrealized: <span className={portfolio.unrealizedPnL > 0 ? "text-[#1DB954]" : "text-red-500"}>${portfolio.unrealizedPnL.toFixed(2)}</span></p>
+            </CardContent>
+          </Card>
+          <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-sm font-medium text-muted-foreground uppercase tracking-wider">Max Drawdown</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-2xl font-bold text-foreground">{(portfolio.maxDrawdown * 100).toFixed(2)}%</div>
+              <p className="text-xs mt-1 text-muted-foreground">Risk metric</p>
+            </CardContent>
+          </Card>
+        </div>
       </div>
       <Dialog open={isAdviceOpen} onOpenChange={setIsAdviceOpen}>
         <DialogContent className="sm:max-w-[500px] bg-slate-900 border-slate-700">

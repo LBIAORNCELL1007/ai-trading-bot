@@ -91,7 +91,7 @@ export function FinancialChart({ data, colors: {
                 horzLines: { color: 'rgba(42, 46, 57, 0.5)' },
             },
             width: chartContainerRef.current.clientWidth,
-            height: 400,
+            height: 600,
             timeScale: {
                 timeVisible: true,
                 secondsVisible: false,
@@ -253,7 +253,7 @@ export function FinancialChart({ data, colors: {
                 </div>
             </div>
 
-            <div ref={chartContainerRef} className="w-full h-[400px]" />
+            <div ref={chartContainerRef} className="w-full h-[600px]" />
         </div>
     )
 }

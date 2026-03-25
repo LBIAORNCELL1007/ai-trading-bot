@@ -63,7 +63,7 @@ export function CryptoSearch() {
             if (query.trim().length >= 1) setIsOpen(true)
           }}
           onBlur={() => setIsFocused(false)}
-          className="pl-12 pr-10 h-12 text-base border-2 border-primary/20 hover:border-primary/40 focus:border-primary transition-colors"
+          className="pl-12 pr-10 h-12 text-base bg-[#1DB954]/5 border-2 border-[#1DB954]/20 hover:border-[#1DB954]/40 focus:border-[#1DB954] focus:bg-[#1DB954]/10 transition-all text-foreground placeholder:text-muted-foreground/60"
         />
         {query && (
           <button

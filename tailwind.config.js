@@ -18,11 +18,22 @@ module.exports = {
     },
     extend: {
       colors: {
+        // Keeping shadcn variables for system compatibility
         border: "hsl(var(--border))",
         input: "hsl(var(--input))",
         ring: "hsl(var(--ring))",
         background: "hsl(var(--background))",
         foreground: "hsl(var(--foreground))",
+
+        // YOUR MODERN INNOVATOR THEME
+        brand: {
+          charcoal: "#121212",
+          blue: "#3366FF",
+          purple: "#8A2BE2",
+          green: "#1DB954",
+          gray: "#EAEAEA",
+        },
+
         primary: {
           DEFAULT: "hsl(var(--primary))",
           foreground: "hsl(var(--primary-foreground))",

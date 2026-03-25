@@ -4,18 +4,24 @@ import Link from 'next/link'
 import { TradingPairSelector } from '@/components/trading-pair-selector'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
-import { ArrowLeft } from 'lucide-react'
+import { ArrowLeft, RotateCcw } from 'lucide-react'
 
 export default function SettingsPage() {
   return (
-    <div className="min-h-screen bg-gradient-to-b from-background to-background/80">
+    <div className="min-h-screen bg-[#121212] text-foreground">
       <div className="container mx-auto px-4 py-12">
         {/* Header */}
         <div className="mb-12">
-          <Link href="/crypto" className="flex items-center gap-2 mb-6 text-primary hover:text-primary/80 transition-colors">
-            <ArrowLeft className="w-4 h-4" />
-            Back to Coins
-          </Link>
+          <div className="flex items-center justify-between mb-8">
+            <Link href="/dashboard" className="flex items-center gap-2 text-muted-foreground hover:text-[#1DB954] transition-colors font-medium">
+              <RotateCcw className="w-4 h-4" />
+              Back to Market
+            </Link>
+            <Link href="/crypto" className="flex items-center gap-2 text-[#1DB954] hover:text-[#1DB954]/80 transition-all font-bold group">
+              <ArrowLeft className="w-4 h-4 group-hover:-translate-x-1 transition-transform" />
+              Back to Coins
+            </Link>
+          </div>
 
           <h1 className="text-4xl font-bold mb-3 text-balance">
             Settings
@@ -32,7 +38,7 @@ export default function SettingsPage() {
             <TradingPairSelector />
 
             {/* Display Preferences */}
-            <Card>
+            <Card className="bg-[#1A1A1A] border-[#333]/50 shadow-xl backdrop-blur-sm">
               <CardHeader>
                 <CardTitle>Display Preferences</CardTitle>
                 <CardDescription>
@@ -78,7 +84,7 @@ export default function SettingsPage() {
             </Card>
 
             {/* Data Sources */}
-            <Card>
+            <Card className="bg-[#1A1A1A] border-[#333]/50 shadow-xl backdrop-blur-sm">
               <CardHeader>
                 <CardTitle>Data Sources</CardTitle>
                 <CardDescription>
@@ -105,7 +111,7 @@ export default function SettingsPage() {
           {/* Sidebar Info */}
           <div className="space-y-6">
             {/* About Section */}
-            <Card>
+            <Card className="bg-[#1A1A1A] border-[#333]/50 shadow-xl backdrop-blur-sm">
               <CardHeader>
                 <CardTitle className="text-lg">About This Site</CardTitle>
               </CardHeader>
@@ -128,7 +134,7 @@ export default function SettingsPage() {
             </Card>
 
             {/* Quick Links */}
-            <Card>
+            <Card className="bg-[#1A1A1A] border-[#333]/50 shadow-xl backdrop-blur-sm">
               <CardHeader>
                 <CardTitle className="text-lg">Quick Links</CardTitle>
               </CardHeader>
@@ -151,7 +157,7 @@ export default function SettingsPage() {
             </Card>
 
             {/* Stats Card */}
-            <Card>
+            <Card className="bg-[#1A1A1A] border-[#333]/50 shadow-xl backdrop-blur-sm">
               <CardHeader>
                 <CardTitle className="text-lg">Data Coverage</CardTitle>
               </CardHeader>

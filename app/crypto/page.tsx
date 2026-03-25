@@ -3,7 +3,7 @@
 import Link from "next/link"
 import React from "react"
 import { useState } from 'react'
-import { TrendingUp } from 'lucide-react'
+import { TrendingUp, RotateCcw } from 'lucide-react'
 import { useCoins, useTrendingCoins } from '@/hooks/use-crypto-data'
 import { CoinTable } from '@/components/coin-table'
 import { CryptoSearch } from '@/components/crypto-search'
@@ -23,10 +23,18 @@ export default function CryptoPage() {
   const { coins: trendingCoins, loading: trendingLoading } = useTrendingCoins()
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-background to-background/80">
+    <div className="min-h-screen bg-[#121212] text-foreground">
       <div className="container mx-auto px-4 py-12">
         {/* Header */}
         <div className="mb-12">
+          <div className="flex items-center justify-between mb-6">
+            <Link href="/dashboard">
+              <Button variant="ghost" className="hover:bg-[#1DB954]/10 text-muted-foreground hover:text-[#1DB954] gap-2">
+                <RotateCcw className="w-4 h-4" />
+                Back to Market
+              </Button>
+            </Link>
+          </div>
           <div className="flex items-center gap-3 mb-3">
             <h1 className="text-4xl font-bold text-balance">
               Cryptocurrency Market Data
@@ -70,10 +78,10 @@ export default function CryptoPage() {
                 {trendingCoins.slice(0, 6).map((coin) => (
                   <Link
                     key={coin.id}
-                    href={`/coins/${coin.id}`}
+                    href={`/trade/${coin.symbol.toUpperCase()}`}
                     className="group"
                   >
-                    <Card className="hover:border-primary transition-colors h-full">
+                    <Card className="bg-[#1A1A1A] border-[#333]/50 hover:border-[#1DB954]/50 transition-colors h-full">
                       <CardContent className="p-6">
                         <div className="flex items-start justify-between mb-3">
                           <div className="flex items-center gap-3 flex-1 min-w-0">

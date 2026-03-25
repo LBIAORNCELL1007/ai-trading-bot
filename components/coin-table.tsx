@@ -51,7 +51,7 @@ export function CoinTable({ coins, loading }: CoinTableProps) {
 
   const getPriceChangeColor = (change: number | null) => {
     if (change === null) return 'text-muted-foreground'
-    if (change > 0) return 'text-green-500'
+    if (change > 0) return 'text-[#1DB954]'
     if (change < 0) return 'text-red-500'
     return 'text-muted-foreground'
   }
@@ -67,38 +67,38 @@ export function CoinTable({ coins, loading }: CoinTableProps) {
   }
 
   return (
-    <div className="w-full overflow-x-auto rounded-lg border border-border">
+    <div className="w-full overflow-x-auto rounded-xl border border-[#333]/50 bg-[#121212] shadow-2xl">
       <Table>
-        <TableHeader>
-          <TableRow className="bg-muted/50 hover:bg-muted/50">
-            <TableHead className="w-12">#</TableHead>
-            <TableHead className="min-w-40">Coin</TableHead>
-            <TableHead className="text-right">Price</TableHead>
-            <TableHead className="text-right">24h Change</TableHead>
-            <TableHead className="text-right">7d Change</TableHead>
+        <TableHeader className="bg-black/20">
+          <TableRow className="border-b border-[#333]/50 hover:bg-transparent">
+            <TableHead className="w-12 text-[10px] uppercase tracking-widest text-muted-foreground font-bold py-4">#</TableHead>
+            <TableHead className="min-w-40 text-[10px] uppercase tracking-widest text-muted-foreground font-bold py-4">Coin</TableHead>
+            <TableHead className="text-right text-[10px] uppercase tracking-widest text-muted-foreground font-bold py-4">Price</TableHead>
+            <TableHead className="text-right text-[10px] uppercase tracking-widest text-muted-foreground font-bold py-4">24h Change</TableHead>
+            <TableHead className="text-right text-[10px] uppercase tracking-widest text-muted-foreground font-bold py-4">7d Change</TableHead>
             <TableHead
-              className="text-right cursor-pointer hover:text-foreground"
+              className="text-right text-[10px] uppercase tracking-widest text-muted-foreground font-bold py-4 cursor-pointer hover:text-[#1DB954] transition-colors"
               onClick={() => setSortBy(sortBy === 'marketCap' ? 'priceChangePercentage24h' : 'marketCap')}
             >
               Market Cap
             </TableHead>
-            <TableHead className="text-right">Volume 24h</TableHead>
-            <TableHead className="text-right">Circulating Supply</TableHead>
+            <TableHead className="text-right text-[10px] uppercase tracking-widest text-muted-foreground font-bold py-4">Volume 24h</TableHead>
+            <TableHead className="text-right text-[10px] uppercase tracking-widest text-muted-foreground font-bold py-4">Circulating Supply</TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {sortedCoins.map((coin, index) => (
             <TableRow
               key={coin.id}
-              className="hover:bg-muted/50 transition-colors border-b border-border/50"
+              className="hover:bg-[#1DB954]/5 transition-all duration-200 border-b border-[#333]/30 group"
             >
               <TableCell className="text-xs font-medium text-muted-foreground">{index + 1}</TableCell>
               <TableCell>
                 <Link
-                  href={`/coins/${coin.id}`}
-                  className="flex items-center gap-3 font-medium hover:text-primary transition-colors"
+                  href={`/trade/${coin.symbol.toUpperCase()}`}
+                  className="flex items-center gap-3 font-bold text-[#EAECEF] group-hover:text-[#1DB954] transition-colors"
                 >
-                  <div className="w-7 h-7 rounded-full bg-muted flex items-center justify-center flex-shrink-0 overflow-hidden">
+                  <div className="w-8 h-8 rounded-full bg-[#1A1A1A] border border-[#333]/50 flex items-center justify-center flex-shrink-0 overflow-hidden shadow-inner">
                     {coin.image && (
                       <img
                         src={coin.image || "/placeholder.svg"}
