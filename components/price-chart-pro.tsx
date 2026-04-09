@@ -39,7 +39,8 @@ export function PriceChartPro({ data, coin, currentPrice, loading, selectedRange
     onTimeRangeChange?.(range)
   }
 
-  const chartData = data.slice(-500).map((point) => ({
+  // Show all data without slicing to ensure full historical view is available
+  const chartData = data.map((point) => ({
     timestamp: new Date(point.timestamp).getTime(),
     time: new Date(point.timestamp).toLocaleDateString('en-US', {
       month: 'short',

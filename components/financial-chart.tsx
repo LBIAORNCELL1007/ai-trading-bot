@@ -12,10 +12,11 @@ import {
     HistogramSeries,
     LineSeries
 } from "lightweight-charts"
-import type { BinanceKline } from "@/lib/binance-websocket"
+import type { BinanceKline, PrecomputedMAs } from "@/lib/binance-websocket"
 
 interface FinancialChartProps {
     data: BinanceKline[]
+    precomputedMAs?: PrecomputedMAs
     colors?: {
         backgroundColor?: string
         lineColor?: string
@@ -25,7 +26,7 @@ interface FinancialChartProps {
     }
 }
 
-export function FinancialChart({ data, colors: {
+export function FinancialChart({ data, precomputedMAs, colors: {
     backgroundColor = '#1e1e1e',
     textColor = '#d1d5db',
 } = {} }: FinancialChartProps) {
@@ -57,7 +58,6 @@ export function FinancialChart({ data, colors: {
                 value: sum / count
             })
         }
-        return result
         return result
     }
 
@@ -96,6 +96,20 @@ export function FinancialChart({ data, colors: {
                 timeVisible: true,
                 secondsVisible: false,
                 borderColor: '#2B2B43',
+                rightOffset: 8,
+                fixLeftEdge: false,
+                fixRightEdge: false,
+            },
+            handleScroll: {
+                mouseWheel: true,
+                pressedMouseMove: true,
+                horzTouchDrag: true,
+                vertTouchDrag: true,
+            },
+            handleScale: {
+                axisPressedMouseMove: true,
+                mouseWheel: true,
+                pinch: true,
             },
             crosshair: {
                 mode: CrosshairMode.Normal,
@@ -143,16 +157,13 @@ export function FinancialChart({ data, colors: {
         const ma99Series = chart.addSeries(LineSeries, { color: '#06b6d4', lineWidth: 1, crosshairMarkerVisible: false })
         ma99SeriesRef.current = ma99Series
 
-        // Crosshair Move Handler
+        // Crosshair Move Handler - Only update when hovering over valid data points
         chart.subscribeCrosshairMove(param => {
-            if (param.time) {
+            if (param.time && param.point) {
                 const dataPoint = data.find(d => d.time / 1000 === param.time)
                 if (dataPoint) {
                     setCurrentData(dataPoint)
-                    // Calculate MAs for this point (or look up if pre-calculated)
-                    // For simplicity, we can calculate on fly or look up if we stored them
-                    // MAs are simple: sum of last N closes
-                    // Let's find index
+                    // Calculate MAs for this point
                     const index = data.indexOf(dataPoint)
                     if (index >= 0) {
                         const ma7 = calculateSimpleMA(data, 7, index)
@@ -161,19 +172,9 @@ export function FinancialChart({ data, colors: {
                         setMaValues({ ma7, ma25, ma99 })
                     }
                 }
-            } else {
-                // Revert to latest
-                if (data.length > 0) {
-                    const last = data[data.length - 1]
-                    setCurrentData(last)
-                    const index = data.length - 1
-                    setMaValues({
-                        ma7: calculateSimpleMA(data, 7, index),
-                        ma25: calculateSimpleMA(data, 25, index),
-                        ma99: calculateSimpleMA(data, 99, index)
-                    })
-                }
             }
+            // Removed the else clause that was auto-reverting to latest data
+            // This prevents the "redirecting to present graph" behavior
         })
 
         // Initial Set
@@ -194,7 +195,7 @@ export function FinancialChart({ data, colors: {
             window.removeEventListener('resize', handleResize)
             chart.remove()
         }
-    }, [backgroundColor, textColor, data]) // Re-bind when data changes to have fresh closure
+    }, [backgroundColor, textColor]) // Only re-create chart when colors change, not when data updates
 
     // Update Data
     useEffect(() => {
@@ -220,15 +221,29 @@ export function FinancialChart({ data, colors: {
             candleSeriesRef.current.setData(candleData)
             volumeSeriesRef.current.setData(volumeData)
 
-            if (ma7SeriesRef.current) ma7SeriesRef.current.setData(calculateMA(data, 7))
-            if (ma25SeriesRef.current) ma25SeriesRef.current.setData(calculateMA(data, 25))
-            if (ma99SeriesRef.current) ma99SeriesRef.current.setData(calculateMA(data, 99))
+            if (ma7SeriesRef.current) {
+                ma7SeriesRef.current.setData(precomputedMAs?.ma7 ?? calculateMA(data, 7))
+            }
+            if (ma25SeriesRef.current) {
+                ma25SeriesRef.current.setData(precomputedMAs?.ma25 ?? calculateMA(data, 25))
+            }
+            if (ma99SeriesRef.current) {
+                ma99SeriesRef.current.setData(precomputedMAs?.ma99 ?? calculateMA(data, 99))
+            }
+
+            // Fit content once when chart first receives data
+            if (chartRef.current && data.length > 0) {
+                const visibleRange = chartRef.current.timeScale().getVisibleRange()
+                if (!visibleRange) {
+                    chartRef.current.timeScale().fitContent()
+                }
+            }
 
         } catch (e) {
             console.error("Error updating chart data:", e)
         }
 
-    }, [data])
+    }, [data, precomputedMAs])
 
     return (
         <div className="relative">

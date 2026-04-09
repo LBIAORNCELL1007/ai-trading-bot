@@ -67,8 +67,10 @@ import {
 import {
   binanceWS,
   getHistoricalKlines,
+  getCoingeckoHistoryFull,
   getCurrentPrice,
-  type BinanceKline
+  type BinanceKline,
+  type PrecomputedMAs
 } from "@/lib/binance-websocket"
 import { MarketAnalyzer, type MarketAnalysis } from "@/lib/market-analyzer"
 import { WalkForwardAnalyzer, type WFAReport } from "@/lib/walk-forward-analyzer"
@@ -163,14 +165,14 @@ function deriveCoinAnalysis(symbol: string, change24h: string, price: string) {
 
   // Sentiment scores (0-10)
   const sentScore = 5 + pct * 0.4
-  const socialMedia  = Math.min(10, Math.max(0, sentScore + 0.8)).toFixed(2)
-  const socialSent   = Math.min(10, Math.max(0, sentScore + 0.3)).toFixed(2)
-  const news         = Math.min(10, Math.max(0, sentScore - 0.1)).toFixed(2)
-  const kol          = Math.min(10, Math.max(0, sentScore + 0.6)).toFixed(2)
+  const socialMedia = Math.min(10, Math.max(0, sentScore + 0.8)).toFixed(2)
+  const socialSent = Math.min(10, Math.max(0, sentScore + 0.3)).toFixed(2)
+  const news = Math.min(10, Math.max(0, sentScore - 0.1)).toFixed(2)
+  const kol = Math.min(10, Math.max(0, sentScore + 0.6)).toFixed(2)
   const overallScore = ((+socialMedia + +socialSent + +news + +kol) / 4).toFixed(2)
-  const sentiment    = +overallScore >= 6.5 ? 'Strong Positive' : +overallScore >= 5 ? 'Positive' : +overallScore >= 4 ? 'Neutral' : 'Negative'
+  const sentiment = +overallScore >= 6.5 ? 'Strong Positive' : +overallScore >= 5 ? 'Positive' : +overallScore >= 4 ? 'Neutral' : 'Negative'
   const sentimentColor = +overallScore >= 6 ? '#1DB954' : +overallScore >= 5 ? '#1DB954' : '#F6465D'
-  const volText      = `${(2.1 + strength).toFixed(2)}k`
+  const volText = `${(2.1 + strength).toFixed(2)}k`
 
   return {
     rsi: rsi.toFixed(1), rsiSignal,
@@ -372,7 +374,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
 
   // Resolve initial config derived from URL if present
   const activeInitialData = initialSymbol ? liveCoins.find(c => c.symbol === initialSymbol) : null;
-  
+
   const [isCoinSelected, setIsCoinSelected] = useState(!!initialSymbol);
   const [selectedCoinData, setSelectedCoinData] = useState<any>(activeInitialData);
   const { toast } = useToast()
@@ -396,6 +398,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
   ])
   const [selectedSymbol, setSelectedSymbol] = useState(initialSymbol || "BTCUSDT")
   const [selectedTimeframe, setSelectedTimeframe] = useState("15m") // Default to 15m
+  const [precomputedMAs, setPrecomputedMAs] = useState<PrecomputedMAs | undefined>(undefined)
   const [selectedStrategy, setSelectedStrategy] = useState("MULTI_SIGNAL")
   const [riskPerTrade, setRiskPerTrade] = useState(2)
   const [maxPositions, setMaxPositions] = useState(5)
@@ -583,7 +586,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
       const formattedSymbol = initialSymbol.endsWith('USDT') ? initialSymbol : `${initialSymbol}USDT`
       setSelectedSymbol(formattedSymbol)
       setIsCoinSelected(true)
-      
+
       const found = MOCK_TRENDING_COINS.find(c => c.symbol === formattedSymbol || c.symbol === initialSymbol)
       if (found) {
         setSelectedCoinData(found)
@@ -604,26 +607,36 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
 
   // Load configuration and presets from localStorage on mount
   useEffect(() => {
-    const savedConfig = localStorage.getItem('tradingConfig')
-    if (savedConfig) {
-      try {
-        const config: TradingConfig = JSON.parse(savedConfig)
-        if (!initialSymbol) {
-          setSelectedSymbol(config.symbol)
+    const loadConfig = () => {
+      const savedConfig = localStorage.getItem('tradingConfig')
+      if (savedConfig) {
+        try {
+          const config: TradingConfig = JSON.parse(savedConfig)
+          if (!initialSymbol) {
+            setSelectedSymbol(config.symbol)
+          }
+          setSelectedTimeframe(config.timeframe)
+          setSelectedStrategy(config.strategy)
+          setRiskPerTrade(config.riskPerTrade)
+  
+          setMaxPositions(config.maxPositions)
+          setStopLoss(config.stopLoss ?? 2.0)
+          setTakeProfit(config.takeProfit ?? 4.0)
+          setTrailingStop(config.trailingStop ?? 1.0)
+          setLeverage(config.leverage ?? 1)
+        } catch (e) {
+          console.error('Failed to load config:', e)
         }
-        setSelectedTimeframe(config.timeframe)
-        setSelectedStrategy(config.strategy)
-        setRiskPerTrade(config.riskPerTrade)
-
-        setMaxPositions(config.maxPositions)
-        setStopLoss(config.stopLoss ?? 2.0)
-        setTakeProfit(config.takeProfit ?? 4.0)
-        setTrailingStop(config.trailingStop ?? 1.0)
-        setLeverage(config.leverage ?? 1)
-      } catch (e) {
-        console.error('Failed to load config:', e)
       }
     }
+
+    loadConfig()
+
+    const handleConfigUpdated = () => {
+      loadConfig()
+    }
+
+    window.addEventListener('tradingConfigUpdated', handleConfigUpdated)
 
     // Load saved presets
     const presets = localStorage.getItem('tradingPresets')
@@ -634,7 +647,11 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
         console.error('Failed to load presets:', e)
       }
     }
-  }, [])
+
+    return () => {
+      window.removeEventListener('tradingConfigUpdated', handleConfigUpdated)
+    }
+  }, [initialSymbol])
 
 
 
@@ -659,26 +676,26 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
     const generateTick = () => {
       const p = currentPriceRef.current;
       if (p <= 0) return;
-      const asks = Array.from({length: 35}).map((_, i) => ({ 
-        price: p + (35-i)*(p*0.0002) + Math.random()*(p*0.0001), 
-        amount: Math.random()*2.5, 
-        total: Math.random()*10 
+      const asks = Array.from({ length: 35 }).map((_, i) => ({
+        price: p + (35 - i) * (p * 0.0002) + Math.random() * (p * 0.0001),
+        amount: Math.random() * 2.5,
+        total: Math.random() * 10
       }));
-      const bids = Array.from({length: 35}).map((_, i) => ({ 
-        price: p - (i+1)*(p*0.0002) - Math.random()*(p*0.0001), 
-        amount: Math.random()*2.5, 
-        total: Math.random()*10 
+      const bids = Array.from({ length: 35 }).map((_, i) => ({
+        price: p - (i + 1) * (p * 0.0002) - Math.random() * (p * 0.0001),
+        amount: Math.random() * 2.5,
+        total: Math.random() * 10
       }));
-      
+
       setOrderBookAsks(asks);
       setOrderBookBids(bids);
 
       setMarketTradesList(prev => {
-        const newTrade = { 
-          price: p + (Math.random() - 0.5) * (p*0.0004), 
-          amount: (Math.random() * 2) + 0.01, 
-          time: new Date().toLocaleTimeString('en-US', {hour12:false, hour:'2-digit', minute:'2-digit', second:'2-digit'}), 
-          isBuyer: Math.random() > 0.5 
+        const newTrade = {
+          price: p + (Math.random() - 0.5) * (p * 0.0004),
+          amount: (Math.random() * 2) + 0.01,
+          time: new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }),
+          isBuyer: Math.random() > 0.5
         };
         return [newTrade, ...prev].slice(0, 15);
       });
@@ -842,85 +859,82 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
   // ════════════════════════════════════════════════════════════════
 
   const handleAIAutoConfigure = useCallback(async (options?: { silent?: boolean }) => {
-    // Abort any in-flight analysis (race condition lock)
-    if (aiAbortRef.current) {
-      aiAbortRef.current.abort()
-    }
-    const abortCtrl = new AbortController()
-    aiAbortRef.current = abortCtrl
-
     if (!options?.silent) setIsAIConfiguring(true)
 
     try {
-      const portfolioCtx = {
-        totalPnL: portfolio.totalPnL,
-        equity: portfolio.equity,
-        openTrades: trades
-          .filter(t => t.status === 'OPEN')
-          .map(t => ({ symbol: t.symbol, side: t.side }))
+      // 1. Call the Python FastAPI Microservice
+      const response = await fetch('http://127.0.0.1:8000/api/predict', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ symbol: selectedSymbol }),
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to connect to AI Engine');
       }
 
-      const result = await aiConfigEngine.analyze(
-        selectedSymbol,
-        portfolioCtx,
-        abortCtrl.signal
-      )
+      const data = await response.json();
 
-      if (abortCtrl.signal.aborted) return
-
-      setAiResult(result)
-      setAiLastAnalyzedAt(result.analyzedAt)
-
-      // Non-destructive logic: if engine is running or user has manual overrides, suggest don't apply
-      const shouldOnlySuggest = isRunning || aiManualOverrides.current.size > 0
-
-      if (shouldOnlySuggest && options?.silent) {
-        // Background refresh — just store as pending, don't overwrite
-        setPendingAiSuggestion(result)
-        return
+      // 2. Lock the UI into the XGBoost training parameters
+      setTakeProfit(1.5);
+      setStopLoss(1.0);
+      setSelectedTimeframe("1h");
+      
+      // 3. Update the Confidence Badge & UI
+      const confidenceScore = data.confidence * 100;
+      setAiResult({
+        strategy: "XGBoost ML",
+        timeframe: "1h",
+        riskPerTrade: riskPerTrade,
+        maxPositions: maxPositions,
+        stopLoss: 1.0,
+        takeProfit: 1.5,
+        trailingStop: trailingStop,
+        leverage: leverage,
+        confidence: confidenceScore,
+        marketRegime: data.action === 1 ? 'STRONG_TREND' : 'RANGING',
+        reasoning: [],
+        analyzedAt: new Date(),
+        mtfConfluence: { score: 0, agreement: false, bullish: 0, bearish: 0 }
+      } as any);
+      
+      setAiLastAnalyzedAt(new Date());
+      
+      const fields = new Set(['stopLoss', 'takeProfit', 'timeframe', 'strategy']);
+      setAiRecommendedFields(fields);
+      aiManualOverrides.current.clear();
+      
+      // 4. Arm the system based on the AI's action (1 = Buy/Arm, 0 = Wait)
+      if (data.action === 1) {
+         console.log("AI Armed: Favorable market structure detected.");
+         setIsRunning(true);
+      } else {
+         console.log("AI Warning: Sideways or bearish structure. Sitting out.");
+         setIsRunning(false);
       }
-
-      if (result.confidence < 50) {
-        // Low confidence — suggest only, don't apply
-        setPendingAiSuggestion(result)
-        if (!options?.silent) {
-          toast({
-            title: "⚠️ AI Analysis — Low Confidence",
-            description: `Confidence ${result.confidence}% is too low to auto-apply. Review suggestions manually.`,
-            variant: "destructive"
-          })
-        }
-        return
-      }
-
-      // Apply configuration
-      applyAIConfig(result)
 
       if (!options?.silent) {
-        const badge = result.confidence >= 70 ? '✦' : '⚠'
         toast({
-          title: `${badge} AI Configuration Applied`,
-          description: `Strategy: ${result.strategy.replace(/_/g, ' ')} | Confidence: ${result.confidence}% | Regime: ${result.marketRegime}${
-            result.backtestResult ? ` | Backtest: ${result.backtestResult.winRate.toFixed(0)}% win rate` : ''
-          }`,
+          title: "✦ AI Configuration Applied",
+          description: `Action: ${data.action === 1 ? 'Armed' : 'Standby'} | Confidence: ${confidenceScore.toFixed(1)}%`,
         })
       }
-    } catch (err: any) {
-      if (err?.name === 'AbortError') return // Expected
-      console.error('[AIConfigEngine] Analysis failed:', err)
+
+    } catch (error: any) {
+      console.error("AI Microservice is offline:", error);
       if (!options?.silent) {
         toast({
-          title: "AI Analysis Failed",
-          description: err?.message || "Could not analyze market. Your current settings are unchanged.",
+          title: "AI Microservice Error",
+          description: error?.message || "Ensure your FastAPI server is running.",
           variant: "destructive"
-        })
+        });
       }
     } finally {
-      if (!abortCtrl.signal.aborted) {
-        setIsAIConfiguring(false)
-      }
+      setIsAIConfiguring(false)
     }
-  }, [selectedSymbol, portfolio, trades, isRunning, toast])
+  }, [selectedSymbol, riskPerTrade, maxPositions, trailingStop, leverage, toast])
 
   const applyAIConfig = useCallback((result: AIConfigResult) => {
     aiManualOverrides.current.clear()
@@ -977,7 +991,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
       }
     }, 800)
     return () => clearTimeout(timeout)
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSymbol])
 
   // Delete preset
@@ -1036,18 +1050,19 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
       if (isMounted) setPriceLoading(true)
 
       try {
-        // Fetch historical klines first
-        const historicalData = await getHistoricalKlines(selectedSymbol, selectedTimeframe, 500)
+        if (selectedTimeframe === 'max') {
+          const coinId = getCoinIdFromSymbol(selectedSymbol)
+          const { klines, mas } = await getCoingeckoHistoryFull(coinId, 'max')
 
-        if (isMounted) {
-          if (historicalData.length > 0) {
-            setCandlestickData(historicalData)
-            setCurrentPrice(historicalData[historicalData.length - 1].close)
+          if (isMounted) {
+            setPrecomputedMAs(mas)
+            setWsConnected(false)
+            setCandlestickData(klines)
+            if (klines.length > 0) {
+              setCurrentPrice(klines[klines.length - 1].close)
+            }
 
-            // ... (rest of success logic) ...
-
-            // Convert to simple price data for the area chart
-            const chartData = historicalData.map((kline) => {
+            const chartData = klines.map((kline) => {
               const date = new Date(kline.time)
               return {
                 time: `${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}`,
@@ -1056,65 +1071,82 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
               }
             })
             setPriceData(chartData)
-          } else {
-            // Handle Invalid Symbol / No Data case
-            setCandlestickData([])
-            setWsConnected(false)
-            toast({
-              title: "❌ Invalid Trading Pair",
-              description: `Could not load data for "${selectedSymbol}".\n\nDid you mean "${selectedSymbol}T"? (e.g. BTCUSDT instead of BTCUSD)`,
-              variant: "destructive"
-            })
           }
+        } else {
+          // Fetch historical klines first
+          const historicalData = await getHistoricalKlines(selectedSymbol, selectedTimeframe, 500)
+
+          if (isMounted) {
+            setPrecomputedMAs(undefined)
+            if (historicalData.length > 0) {
+              setCandlestickData(historicalData)
+              setCurrentPrice(historicalData[historicalData.length - 1].close)
+
+              // Convert to simple price data for the area chart
+              const chartData = historicalData.map((kline) => {
+                const date = new Date(kline.time)
+                return {
+                  time: `${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}`,
+                  price: kline.close,
+                  volume: kline.volume
+                }
+              })
+              setPriceData(chartData)
+            } else {
+              setCandlestickData([])
+              setWsConnected(false)
+              toast({
+                title: "❌ Invalid Trading Pair",
+                description: `Could not load data for "${selectedSymbol}".\n\nDid you mean "${selectedSymbol}T"? (e.g. BTCUSDT instead of BTCUSD)`,
+                variant: "destructive"
+              })
+            }
+          }
+
+          // Subscribe to real-time updates
+          unsubscribe = binanceWS.subscribeKline(
+            selectedSymbol,
+            selectedTimeframe,
+            (kline) => {
+              if (!isMounted) return
+
+              setWsConnected(true)
+              setCurrentPrice(kline.close)
+
+              setCandlestickData((prev) => {
+                const newData = [...prev]
+                const lastCandle = newData[newData.length - 1]
+
+                if (lastCandle && lastCandle.time === kline.time) {
+                  newData[newData.length - 1] = kline
+                } else if (kline.isClosed || !lastCandle || kline.time > lastCandle.time) {
+                  newData.push(kline)
+                  if (newData.length > 500) newData.shift()
+                }
+
+                return newData
+              })
+
+              setPriceData((prev) => {
+                const date = new Date(kline.time)
+                const timeStr = `${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}`
+                const newData = [...prev]
+                const lastPoint = newData[newData.length - 1]
+
+                if (lastPoint && lastPoint.time === timeStr) {
+                  newData[newData.length - 1] = { time: timeStr, price: kline.close, volume: kline.volume }
+                } else {
+                  newData.push({ time: timeStr, price: kline.close, volume: kline.volume })
+                  if (newData.length > 50) newData.shift()
+                }
+
+                return newData
+              })
+            }
+          )
+
+          console.log(`[Dashboard] Subscribed to ${selectedSymbol} ${selectedTimeframe} klines`)
         }
-
-        // Subscribe to real-time updates
-        unsubscribe = binanceWS.subscribeKline(
-          selectedSymbol,
-          selectedTimeframe,
-          (kline) => {
-            if (!isMounted) return
-
-            setWsConnected(true)
-            setCurrentPrice(kline.close)
-
-            // Update candlestick data
-            setCandlestickData((prev) => {
-              const newData = [...prev]
-              const lastCandle = newData[newData.length - 1]
-
-              if (lastCandle && lastCandle.time === kline.time) {
-                // Update existing candle
-                newData[newData.length - 1] = kline
-              } else if (kline.isClosed || !lastCandle || kline.time > lastCandle.time) {
-                // Add new candle
-                newData.push(kline)
-                if (newData.length > 500) newData.shift()
-              }
-
-              return newData
-            })
-
-            // Update price data for area chart
-            setPriceData((prev) => {
-              const date = new Date(kline.time)
-              const timeStr = `${date.getHours()}:${String(date.getMinutes()).padStart(2, '0')}`
-              const newData = [...prev]
-              const lastPoint = newData[newData.length - 1]
-
-              if (lastPoint && lastPoint.time === timeStr) {
-                newData[newData.length - 1] = { time: timeStr, price: kline.close, volume: kline.volume }
-              } else {
-                newData.push({ time: timeStr, price: kline.close, volume: kline.volume })
-                if (newData.length > 50) newData.shift()
-              }
-
-              return newData
-            })
-          }
-        )
-
-        console.log(`[Dashboard] Subscribed to ${selectedSymbol} ${selectedTimeframe} klines`)
       } catch (error) {
         console.error('Failed to initialize chart:', error)
         setWsConnected(false)
@@ -1538,7 +1570,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
   return (
     <div className={`min-h-screen bg-[#121212] flex flex-col items-center text-[#EAEAEA] ${initialSymbol ? '' : 'p-6 space-y-6'}`}>
       <div className={`w-full ${initialSymbol ? 'max-w-none' : 'max-w-7xl mx-auto space-y-6'}`}>
-        
+
 
 
         {!isCoinSelected ? (
@@ -1572,7 +1604,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
             {/* Top Market Coins Grid */}
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
               {liveCoins.map((coin) => (
-                <Card 
+                <Card
                   key={coin.symbol}
                   className="bg-[#1A1A1A] border-[#333]/50 shadow-sm hover:border-[#1DB954]/50 hover:shadow-[#1DB954]/10 transition-all cursor-pointer group"
                   onClick={() => handleSelectCoin(coin)}
@@ -1602,14 +1634,14 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                 </Card>
               ))}
             </div>
-            
+
             <Tabs defaultValue="overview" className="w-full">
               <TabsList className="grid w-full grid-cols-3 bg-[#1A1A1A]/80 backdrop-blur-md border border-[#333]/50 shadow-lg min-h-[48px] mb-6">
                 <TabsTrigger value="overview" className="flex items-center text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10">Overview</TabsTrigger>
                 <TabsTrigger value="trading_data" className="flex items-center text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10">Trading Data</TabsTrigger>
                 <TabsTrigger value="ai_select" className="flex items-center text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10">AI Select</TabsTrigger>
               </TabsList>
-              
+
               <TabsContent value="overview" className="space-y-6">
                 {/* High Density Grid */}
                 <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -1625,8 +1657,8 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                       </CardHeader>
                       <CardContent className="p-0 flex flex-col">
                         {category.data.map((coin, i) => (
-                          <div 
-                            key={coin.symbol} 
+                          <div
+                            key={coin.symbol}
                             onClick={() => handleSelectCoin(coin)}
                             className={`flex items-center justify-between p-3 hover:bg-[#333]/30 cursor-pointer transition-colors ${i !== category.data.length - 1 ? 'border-b border-[#333]/30' : ''}`}
                           >
@@ -1666,8 +1698,8 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                       </thead>
                       <tbody>
                         {liveCoins.map((coin, i) => (
-                          <tr 
-                            key={coin.symbol} 
+                          <tr
+                            key={coin.symbol}
                             className={`hover:bg-[#333]/30 transition-colors group cursor-pointer ${i !== liveCoins.length - 1 ? 'border-b border-[#333]/30' : ''}`}
                             onClick={() => handleSelectCoin(coin)}
                           >
@@ -1687,8 +1719,8 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                             <td className="px-4 py-4 text-right text-muted-foreground">{coin.cap}</td>
                             <td className="px-4 py-4 text-right text-muted-foreground">{coin.vol}</td>
                             <td className="px-4 py-4 text-right w-[120px]">
-                              <Button 
-                                size="sm" 
+                              <Button
+                                size="sm"
                                 className="bg-[#1DB954]/10 text-[#1DB954] hover:bg-[#1DB954] hover:text-black font-bold border border-[#1DB954]/50 transition-all rounded-md w-full"
                                 onClick={(e) => {
                                   e.stopPropagation();
@@ -1705,11 +1737,11 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                   </CardContent>
                 </Card>
               </TabsContent>
-              
+
               <TabsContent value="trading_data" className="space-y-6">
                 <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
                   {[
-                    "Hot Coins", "Top Gainers", "Top Losers", 
+                    "Hot Coins", "Top Gainers", "Top Losers",
                     "Top Volume", "USD Futures", "Coin Futures"
                   ].map((title, cardIdx) => (
                     <Card key={title} className="bg-[#121418] border-[#2A2D35] shadow-sm rounded-xl overflow-hidden">
@@ -1727,14 +1759,14 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                           <span className="w-20 text-right">24h Change</span>
                         </div>
                         <div className="flex flex-col pb-2">
-                          {(() => { const sorted = title === 'Top Gainers' ? [...liveCoins].sort((a,b) => b.rawChange - a.rawChange) : title === 'Top Losers' ? [...liveCoins].sort((a,b) => a.rawChange - b.rawChange) : title === 'Top Volume' || title === 'USD Futures' || title === 'Coin Futures' ? [...liveCoins].sort((a,b) => b.rawVol - a.rawVol) : liveCoins; return sorted; })().map((coin, i) => {
+                          {(() => { const sorted = title === 'Top Gainers' ? [...liveCoins].sort((a, b) => b.rawChange - a.rawChange) : title === 'Top Losers' ? [...liveCoins].sort((a, b) => a.rawChange - b.rawChange) : title === 'Top Volume' || title === 'USD Futures' || title === 'Coin Futures' ? [...liveCoins].sort((a, b) => b.rawVol - a.rawVol) : liveCoins; return sorted; })().map((coin, i) => {
                             const isPositive = !coin.change24h.startsWith('-');
                             const color = isPositive ? 'text-[#0ECB81]' : 'text-[#F6465D]';
                             const displayChange = title === "Top Losers" && isPositive ? `-${coin.change24h.replace('+', '')}` : coin.change24h;
                             const displayColor = title === "Top Losers" ? 'text-[#F6465D]' : color;
                             return (
-                              <div 
-                                key={`${cardIdx}-${i}`} 
+                              <div
+                                key={`${cardIdx}-${i}`}
                                 className="flex items-center px-4 py-2 hover:bg-[#2A2D35]/40 cursor-pointer transition-colors"
                                 onClick={() => handleSelectCoin(coin)}
                               >
@@ -1754,7 +1786,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                   ))}
                 </div>
               </TabsContent>
-              
+
               <TabsContent value="ai_select" className="space-y-6">
                 <AiSelectPanel coins={liveCoins} onSelectCoin={handleSelectCoin} />
               </TabsContent>
@@ -1766,17 +1798,17 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
             <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-4 bg-[#1A1A1A] p-6 rounded-xl border border-[#333]">
               <div className="flex items-center gap-4">
                 <div className="flex items-center gap-2">
-                  <Button 
-                    variant="ghost" 
-                    className="px-3 hover:bg-[#333] text-muted-foreground hover:text-foreground" 
+                  <Button
+                    variant="ghost"
+                    className="px-3 hover:bg-[#333] text-muted-foreground hover:text-foreground"
                     onClick={() => router.push('/dashboard')}
                   >
                     <RotateCcw className="w-4 h-4 mr-2" />
                     Back to Market
                   </Button>
-                  <Button 
-                    variant="ghost" 
-                    className="px-3 hover:bg-[#1DB954]/10 text-[#1DB954] hover:text-[#1DB954] font-medium" 
+                  <Button
+                    variant="ghost"
+                    className="px-3 hover:bg-[#1DB954]/10 text-[#1DB954] hover:text-[#1DB954] font-medium"
                     onClick={() => router.push('/crypto')}
                   >
                     <Globe className="w-4 h-4 mr-2" />
@@ -1847,9 +1879,8 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                       </div>
                       {/* Result Rows */}
                       {wfaReport.topResults.map((r, i) => (
-                        <div key={r.parameterSet.id} className={`grid grid-cols-12 gap-2 text-xs font-mono px-3 py-2 rounded-md transition-colors ${
-                          i === 0 ? 'bg-blue-500/10 border border-blue-500/30' : 'hover:bg-[#333]/30'
-                        }`}>
+                        <div key={r.parameterSet.id} className={`grid grid-cols-12 gap-2 text-xs font-mono px-3 py-2 rounded-md transition-colors ${i === 0 ? 'bg-blue-500/10 border border-blue-500/30' : 'hover:bg-[#333]/30'
+                          }`}>
                           <span className="col-span-1 text-muted-foreground">{i + 1}</span>
                           <span className="col-span-3 text-foreground truncate" title={r.parameterSet.id}>
                             {i === 0 && <span className="text-blue-400 mr-1">★</span>}
@@ -1907,7 +1938,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
 
             {/* Detailed Asset Grid Layout - 3 COLUMN EXCHANGE Layout */}
             <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
-              
+
               {/* Left Column: Order Book */}
               <div className="lg:col-span-2 space-y-6 flex flex-col h-[1200px]">
                 <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg flex-1 overflow-hidden flex flex-col">
@@ -1931,7 +1962,7 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
                         </div>
                       ))}
                     </div>
-                    
+
                     {/* Current Price Anchor */}
                     <div className="py-2 px-4 border-y border-[#333]/50 bg-black/60 flex items-center justify-between sticky z-20">
                       <span className="text-xl font-bold text-[#1DB954]">{currentPrice > 0 ? currentPrice.toFixed(4) : '--'}</span>
@@ -1956,868 +1987,868 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
               {/* Center Column: Intelligence Engine */}
               <div className="lg:col-span-8 space-y-6">
 
-        {/* Main Content Tabs */}
-        <Tabs value={activeTab} onValueChange={setActiveTab}>
-          <TabsList className="grid w-full grid-cols-4 bg-[#1A1A1A]/80 backdrop-blur-md border border-[#333]/50 shadow-lg min-h-[48px]">
-            <TabsTrigger value="chart" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><Activity className="w-3 h-3 mr-2 hidden md:block" />Chart</TabsTrigger>
-            <TabsTrigger value="info" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><Settings className="w-3 h-3 mr-2 hidden md:block" />Trade Config</TabsTrigger>
-            <TabsTrigger value="data" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><BarChart className="w-3 h-3 mr-2 hidden md:block" />Data</TabsTrigger>
-            <TabsTrigger value="square" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><Globe className="w-3 h-3 mr-2 hidden md:block" />Square</TabsTrigger>
-          </TabsList>
+                {/* Main Content Tabs */}
+                <Tabs value={activeTab} onValueChange={setActiveTab}>
+                  <TabsList className="grid w-full grid-cols-4 bg-[#1A1A1A]/80 backdrop-blur-md border border-[#333]/50 shadow-lg min-h-[48px]">
+                    <TabsTrigger value="chart" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><Activity className="w-3 h-3 mr-2 hidden md:block" />Chart</TabsTrigger>
+                    <TabsTrigger value="info" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><Settings className="w-3 h-3 mr-2 hidden md:block" />Trade Config</TabsTrigger>
+                    <TabsTrigger value="data" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><BarChart className="w-3 h-3 mr-2 hidden md:block" />Data</TabsTrigger>
+                    <TabsTrigger value="square" className="flex items-center text-[10px] md:text-sm font-bold uppercase tracking-wider data-[state=active]:text-[#1DB954] data-[state=active]:bg-[#1DB954]/10"><Globe className="w-3 h-3 mr-2 hidden md:block" />Square</TabsTrigger>
+                  </TabsList>
 
-          {/* Chart Tab: Central Focus */}
-          <TabsContent value="chart" className="space-y-4 mt-4">
-            {/* Risk Intelligence Embedded */}
-            {isCoinSelected && (
-              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
-                <CardHeader className="pb-2">
-                  <CardTitle className="flex items-center gap-2">
-                    <Brain className="w-5 h-5 text-[#1DB954]" />
-                    Risk Intelligence
-                  </CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                    <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30">
-                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">95% Confidence Interval</div>
-                      <div className="text-lg font-bold text-foreground">Value at Risk (VaR)</div>
+                  {/* Chart Tab: Central Focus */}
+                  <TabsContent value="chart" className="space-y-4 mt-4">
+                    {/* Risk Intelligence Embedded */}
+                    {isCoinSelected && (
+                      <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                        <CardHeader className="pb-2">
+                          <CardTitle className="flex items-center gap-2">
+                            <Brain className="w-5 h-5 text-[#1DB954]" />
+                            Risk Intelligence
+                          </CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30">
+                              <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">95% Confidence Interval</div>
+                              <div className="text-lg font-bold text-foreground">Value at Risk (VaR)</div>
+                            </div>
+                            <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30">
+                              <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Topological Persistence Homology</div>
+                              <div className="text-lg font-bold text-foreground">Regime Structure</div>
+                            </div>
+                            <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30">
+                              <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Fractional Differencing (d=0.4)</div>
+                              <div className="text-lg font-bold text-foreground">Stationarity</div>
+                            </div>
+                          </div>
+                        </CardContent>
+                      </Card>
+                    )}
+                    <div className="flex flex-col gap-6">
+                      {/* Price Chart - REAL-TIME from Binance */}
+                      <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                        <CardHeader className="border-b border-[#333]/50 pb-4">
+                          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                            <CardTitle className="text-2xl font-bold flex items-center gap-3 text-foreground">
+                              Price Chart ({selectedSymbol})
+                              {wsConnected && (
+                                <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-green-500/10 border border-green-500/20 text-[10px] text-green-500 font-bold uppercase tracking-widest">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
+                                  LIVE
+                                </div>
+                              )}
+                            </CardTitle>
+                            <div className="flex items-center gap-1 bg-[#121212] p-1 rounded-lg border border-[#333]/30">
+                              {['15m', '1h', '4h', '1d', '1w', 'max'].map(tf => (
+                                <button
+                                  key={tf}
+                                  onClick={() => setSelectedTimeframe(tf)}
+                                  className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all ${selectedTimeframe === tf ? 'bg-[#2B2B43] text-[#EAEAEA]' : 'text-gray-500 hover:text-gray-300'}`}
+                                >
+                                  {tf.toUpperCase()}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        </CardHeader>
+                        <CardContent className="pt-6">
+                          {priceLoading ? (
+                            <div className="h-[600px] flex items-center justify-center">
+                              <div className="text-muted-foreground">Loading price data...</div>
+                            </div>
+                          ) : candlestickData.length === 0 ? (
+                            <div className="h-[600px] flex items-center justify-center">
+                              <div className="text-muted-foreground">No price data available</div>
+                            </div>
+                          ) : (
+                            <div className="w-full h-[600px] relative group">
+                              <FinancialChart data={candlestickData} precomputedMAs={precomputedMAs} />
+                              {/* Strategy Overlay Badge */}
+                              <div className="absolute top-4 left-4 z-10 bg-background/90 backdrop-blur-md border border-border/50 rounded-lg px-3 py-2 shadow-lg flex items-center gap-3 transition-opacity">
+                                <div className={`w-2.5 h-2.5 rounded-full shadow-sm ${isRunning ? "bg-emerald-500 animate-pulse" : "bg-yellow-500"}`} />
+                                <div className="flex flex-col">
+                                  <span className="text-xs font-bold text-foreground tracking-tight leading-none">
+                                    {getStrategyName(selectedStrategy)}
+                                  </span>
+                                  <span className="text-[10px] font-medium text-muted-foreground leading-none mt-1 uppercase tracking-wider">
+                                    {isRunning ? "Running" : "Paused"}
+                                  </span>
+                                </div>
+                              </div>
+
+                              {/* AI Analysis Overlay */}
+                              {isAIEnabled && marketAnalysis && (
+                                <div className="absolute top-4 right-4 z-10 bg-purple-950/80 backdrop-blur-md border border-purple-500/30 rounded-lg px-3 py-2 shadow-lg max-w-[220px]">
+                                  <div className="text-[10px] uppercase text-purple-300 font-bold mb-1 flex justify-between items-center">
+                                    <span>{debugIndicators?.regime?.replace('_', ' ') || 'ANALYZING'}</span>
+                                    <Badge variant="outline" className="text-[9px] h-4 px-1 border-purple-400 text-purple-200">
+                                      {marketAnalysis.confidence * 100}% Conf
+                                    </Badge>
+                                  </div>
+                                  <div className="text-xs font-medium text-white mb-1">
+                                    {getStrategyName(marketAnalysis.recommendedStrategy || selectedStrategy)}
+                                  </div>
+                                  <div className="text-[10px] text-gray-300 leading-tight">
+                                    {marketAnalysis.reasoning}
+                                  </div>
+                                  {debugIndicators?.riskMult !== 1 && (
+                                    <div className="mt-1 pt-1 border-t border-purple-800 text-[9px] text-yellow-300 flex justify-between">
+                                      <span>Dynamic Size:</span>
+                                      <span>{debugIndicators?.riskMult}x</span>
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </CardContent>
+                      </Card>
+
+                      {/* Equity Curve */}
+                      <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                        <CardHeader>
+                          <CardTitle>Equity Curve</CardTitle>
+                          <CardDescription>Account balance over time</CardDescription>
+                        </CardHeader>
+                        <CardContent>
+                          <ResponsiveContainer width="100%" height={300}>
+                            <LineChart data={balanceHistory}>
+                              <CartesianGrid strokeDasharray="3 3" stroke="#333" opacity={0.3} />
+                              <XAxis dataKey="time" stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                              <YAxis stroke="#666" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(value) => `$${value}`} />
+                              <Tooltip contentStyle={{ backgroundColor: "#1A1A1A", border: "1px solid #333", color: "#EAEAEA" }} />
+                              <Line
+                                type="monotone"
+                                dataKey="balance"
+                                stroke="#10b981"
+                                strokeWidth={2}
+                                dot={false}
+                              />
+                            </LineChart>
+                          </ResponsiveContainer>
+                        </CardContent>
+                      </Card>
                     </div>
-                    <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30">
-                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Topological Persistence Homology</div>
-                      <div className="text-lg font-bold text-foreground">Regime Structure</div>
-                    </div>
-                    <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30">
-                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Fractional Differencing (d=0.4)</div>
-                      <div className="text-lg font-bold text-foreground">Stationarity</div>
-                    </div>
-                  </div>
-                </CardContent>
-              </Card>
-            )}
-            <div className="flex flex-col gap-6">
-              {/* Price Chart - REAL-TIME from Binance */}
-              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
-                <CardHeader className="border-b border-[#333]/50 pb-4">
-                  <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-                    <CardTitle className="text-2xl font-bold flex items-center gap-3 text-foreground">
-                      Price Chart ({selectedSymbol})
-                      {wsConnected && (
-                        <div className="flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-green-500/10 border border-green-500/20 text-[10px] text-green-500 font-bold uppercase tracking-widest">
-                          <span className="w-1.5 h-1.5 rounded-full bg-green-500 animate-pulse" />
-                          LIVE
+
+                    {/* Active Trades */}
+                    <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                      <CardHeader>
+                        <CardTitle className="flex items-center">
+                          <Zap className="w-4 h-4 mr-2 text-yellow-500" />
+                          Active Positions ({openTrades.length})
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent>
+                        {openTrades.length === 0 ? (
+                          <p className="text-muted-foreground text-center py-8">No open positions</p>
+                        ) : (
+                          <div className="space-y-2 max-h-64 overflow-y-auto">
+                            {openTrades.map((trade) => (
+                              <div key={trade.id} className="flex items-center justify-between p-3 bg-muted rounded-lg">
+                                <div className="flex items-center gap-3">
+                                  <Badge variant={trade.side === "BUY" ? "default" : "destructive"}>
+                                    {trade.side}
+                                  </Badge>
+                                  <div>
+                                    <p className="font-medium">{trade.symbol}</p>
+                                    <p className="text-sm text-muted-foreground">${trade.entryPrice.toFixed(2)}</p>
+                                  </div>
+                                </div>
+                                <div className="text-right">
+                                  <p className="font-medium">{trade.quantity.toFixed(4)}</p>
+                                  <Badge variant="outline" className="text-yellow-600">
+                                    <Clock className="w-3 h-3 mr-1" />
+                                    Open
+                                  </Badge>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </CardContent>
+                    </Card>
+                  </TabsContent>
+
+                  {/* Data Tab */}
+                  <TabsContent value="data" className="space-y-4 mt-4">
+
+                    {/* SDP Quantitative Metrics Headway Card */}
+                    <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                      <CardHeader className="pb-2">
+                        <CardTitle className="flex items-center gap-2 text-lg text-[#1DB954]">
+                          <Database className="w-5 h-5" />
+                          Quantitative Metrics (SDP)
+                        </CardTitle>
+                        <CardDescription>Live mathematical model encodings for active market conditions.</CardDescription>
+                      </CardHeader>
+                      <CardContent>
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-2">
+                          <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30 flex flex-col justify-between">
+                            <div>
+                              <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Topological Data Analysis</div>
+                              <div className="text-lg font-bold text-foreground">Regime Encoding</div>
+                            </div>
+                            <div className="mt-4 pt-4 border-t border-[#333]/50 space-y-2 text-sm font-mono">
+                              <div className="flex justify-between items-center"><span className="text-muted-foreground">Components (β₀):</span> <span className="text-foreground">12</span></div>
+                              <div className="flex justify-between items-center"><span className="text-muted-foreground">Loops (β₁):</span> <span className="text-foreground">3</span></div>
+                              <div className="flex justify-between items-center"><span className="text-muted-foreground">Voids (β₂):</span> <span className="text-foreground">0</span></div>
+                            </div>
+                          </div>
+
+                          <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30 flex flex-col justify-between">
+                            <div>
+                              <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Stationarity Protocol</div>
+                              <div className="text-lg font-bold text-foreground">Fractional Diff (d=0.4)</div>
+                            </div>
+                            <div className="mt-4 pt-4 border-t border-[#333]/50 text-sm">
+                              <div className="flex justify-center items-center gap-2 mb-3">
+                                <span className="relative flex h-2.5 w-2.5"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#1DB954] opacity-75"></span><span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-[#1DB954]"></span></span>
+                                <span className="font-bold text-foreground tracking-wide">STATIONARITY ACH.</span>
+                              </div>
+                              <p className="text-muted-foreground text-center text-xs">ADF Test p-value: <span className="text-white font-mono">0.014</span> (&lt; 0.05)</p>
+                            </div>
+                          </div>
+
+                          <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30 flex flex-col justify-between">
+                            <div>
+                              <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Risk Bounds</div>
+                              <div className="text-lg font-bold text-foreground">VaR & Expected Shortfall</div>
+                            </div>
+                            <div className="mt-4 pt-4 border-t border-[#333]/50 space-y-2 text-sm font-mono">
+                              <div className="flex justify-between items-center"><span className="text-muted-foreground">VaR (95%):</span> <span className="text-red-400 font-bold">-2.40%</span></div>
+                              <div className="flex justify-between items-center"><span className="text-muted-foreground">CVaR (95%):</span> <span className="text-red-500 font-bold">-3.85%</span></div>
+                              <div className="w-full bg-[#333]/50 h-1.5 rounded-full overflow-hidden flex mt-2"><div className="w-[85%] bg-blue-500/50 h-full"></div><div className="w-[15%] bg-red-500 h-full"></div></div>
+                            </div>
+                          </div>
                         </div>
-                      )}
-                    </CardTitle>
-                    <div className="flex items-center gap-1 bg-[#121212] p-1 rounded-lg border border-[#333]/30">
-                      {['15m', '1h', '4h', '1d', '1w'].map(tf => (
-                        <button
-                          key={tf}
-                          onClick={() => setSelectedTimeframe(tf)}
-                          className={`px-3 py-1.5 text-xs font-bold rounded-md transition-all ${selectedTimeframe === tf ? 'bg-[#2B2B43] text-[#EAEAEA]' : 'text-gray-500 hover:text-gray-300'}`}
-                        >
-                          {tf.toUpperCase()}
-                        </button>
-                      ))}
+                      </CardContent>
+                    </Card>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                      <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                        <CardHeader>
+                          <CardTitle className="flex items-center">
+                            <CheckCircle className="w-4 h-4 mr-2 text-green-500" />
+                            Closed Trades ({closedTrades.length})
+                          </CardTitle>
+                        </CardHeader>
+                        <CardContent>
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-sm">
+                              <thead className="bg-muted">
+                                <tr>
+                                  <th className="px-4 py-2 text-left">Symbol</th>
+                                  <th className="px-4 py-2 text-left">Side</th>
+                                  <th className="px-4 py-2 text-left">Entry</th>
+                                  <th className="px-4 py-2 text-left">Exit</th>
+                                  <th className="px-4 py-2 text-left">Qty</th>
+                                  <th className="px-4 py-2 text-right">PnL</th>
+                                  <th className="px-4 py-2 text-right">%</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {closedTrades.slice(0, 20).map((trade) => (
+                                  <tr key={trade.id} className="border-t hover:bg-muted">
+                                    <td className="px-4 py-2">{trade.symbol}</td>
+                                    <td className="px-4 py-2">
+                                      <Badge variant={trade.side === "BUY" ? "default" : "destructive"}>
+                                        {trade.side}
+                                      </Badge>
+                                    </td>
+                                    <td className="px-4 py-2">${trade.entryPrice.toFixed(2)}</td>
+                                    <td className="px-4 py-2">${(trade.exitPrice || 0).toFixed(2)}</td>
+                                    <td className="px-4 py-2">{trade.quantity.toFixed(4)}</td>
+                                    <td className={`px-4 py-2 text-right ${(trade.pnl || 0) > 0 ? "text-green-500" : "text-red-500"}`}>
+                                      ${(trade.pnl || 0).toFixed(2)}
+                                    </td>
+                                    <td className={`px-4 py-2 text-right ${(trade.pnlPercent || 0) > 0 ? "text-green-500" : "text-red-500"}`}>
+                                      {(trade.pnlPercent || 0).toFixed(2)}%
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </CardContent>
+                      </Card>
                     </div>
-                  </div>
-                </CardHeader>
-                <CardContent className="pt-6">
-                  {priceLoading ? (
-                    <div className="h-[600px] flex items-center justify-center">
-                      <div className="text-muted-foreground">Loading price data...</div>
-                    </div>
-                  ) : candlestickData.length === 0 ? (
-                    <div className="h-[600px] flex items-center justify-center">
-                      <div className="text-muted-foreground">No price data available</div>
-                    </div>
-                  ) : (
-                    <div className="w-full h-[600px] relative group">
-                      <FinancialChart data={candlestickData} />
-                      {/* Strategy Overlay Badge */}
-                      <div className="absolute top-4 left-4 z-10 bg-background/90 backdrop-blur-md border border-border/50 rounded-lg px-3 py-2 shadow-lg flex items-center gap-3 transition-opacity">
-                        <div className={`w-2.5 h-2.5 rounded-full shadow-sm ${isRunning ? "bg-emerald-500 animate-pulse" : "bg-yellow-500"}`} />
-                        <div className="flex flex-col">
-                          <span className="text-xs font-bold text-foreground tracking-tight leading-none">
-                            {getStrategyName(selectedStrategy)}
-                          </span>
-                          <span className="text-[10px] font-medium text-muted-foreground leading-none mt-1 uppercase tracking-wider">
-                            {isRunning ? "Running" : "Paused"}
-                          </span>
-                        </div>
+                    {/* Analytics Section inside Data Tab */}
+                    <div className="space-y-4 mt-6">
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                        <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                          <CardHeader>
+                            <CardTitle>Trade Distribution</CardTitle>
+                          </CardHeader>
+                          <CardContent>
+                            <ResponsiveContainer width="100%" height={300}>
+                              <BarChart
+                                data={[
+                                  { name: "Wins", value: closedTrades.filter((t) => (t.pnl || 0) > 0).length },
+                                  { name: "Losses", value: closedTrades.filter((t) => (t.pnl || 0) < 0).length },
+                                ]}
+                              >
+                                <CartesianGrid strokeDasharray="3 3" stroke="#333" opacity={0.3} />
+                                <XAxis dataKey="name" stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                                <YAxis stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                                <Tooltip contentStyle={{ backgroundColor: "#1A1A1A", border: "1px solid #333", color: "#EAEAEA" }} />
+                                <Bar dataKey="value" fill="#3b82f6" />
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </CardContent>
+                        </Card>
+
+                        <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                          <CardHeader>
+                            <CardTitle>PnL Distribution</CardTitle>
+                          </CardHeader>
+                          <CardContent>
+                            <ResponsiveContainer width="100%" height={300}>
+                              <BarChart
+                                data={closedTrades
+                                  .slice(0, 10)
+                                  .map((t, i) => ({
+                                    name: `Trade ${i + 1}`,
+                                    pnl: t.pnl || 0,
+                                  }))}
+                              >
+                                <CartesianGrid strokeDasharray="3 3" stroke="#333" opacity={0.3} />
+                                <XAxis dataKey="name" stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                                <YAxis stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
+                                <Tooltip contentStyle={{ backgroundColor: "#1A1A1A", border: "1px solid #333", color: "#EAEAEA" }} />
+                                <Bar
+                                  dataKey="pnl"
+                                  fill="#3b82f6"
+                                  style={{ background: "#3b82f6" }}
+                                />
+                              </BarChart>
+                            </ResponsiveContainer>
+                          </CardContent>
+                        </Card>
                       </div>
+                    </div>
+                  </TabsContent>
 
-                      {/* AI Analysis Overlay */}
-                      {isAIEnabled && marketAnalysis && (
-                        <div className="absolute top-4 right-4 z-10 bg-purple-950/80 backdrop-blur-md border border-purple-500/30 rounded-lg px-3 py-2 shadow-lg max-w-[220px]">
-                          <div className="text-[10px] uppercase text-purple-300 font-bold mb-1 flex justify-between items-center">
-                            <span>{debugIndicators?.regime?.replace('_', ' ') || 'ANALYZING'}</span>
-                            <Badge variant="outline" className="text-[9px] h-4 px-1 border-purple-400 text-purple-200">
-                              {marketAnalysis.confidence * 100}% Conf
-                            </Badge>
+                  {/* Square Tab (Gemini Advisor integration point) */}
+                  <TabsContent value="square" className="space-y-4 mt-4">
+                    <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg p-6 flex flex-col items-center justify-center text-center min-h-[400px]">
+                      <Brain className="w-16 h-16 text-purple-500 mb-4 animate-pulse" />
+                      <h3 className="text-2xl font-bold text-white mb-2">Square Intelligence</h3>
+                      <p className="text-muted-foreground mb-6 max-w-md">Connect with the Gemini Neural Network to generate market sentiment, backtesting signals, and auto-tuning boundaries.</p>
+                      <Button onClick={handleAskGemini} disabled={isLoadingAdvice} className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-6 px-8 rounded-xl shadow-lg shadow-purple-900/50">
+                        {isLoadingAdvice ? "Analyzing..." : "Generate Square Analysis"}
+                      </Button>
+                    </Card>
+                  </TabsContent>
+
+                  {/* Info Tab (Settings + Scenarios) */}
+                  <TabsContent value="info" className="space-y-4 mt-4">
+                    <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg mb-6">
+                      <CardHeader>
+                        <CardTitle className="text-lg flex items-center gap-2">
+                          <Activity className="w-5 h-5 text-[#1DB954]" />
+                          Market Scenarios
+                        </CardTitle>
+                      </CardHeader>
+                      <CardContent className="space-y-4 grid grid-cols-3">
+                        <div>
+                          <div className="text-sm text-muted-foreground mb-1">Market Cap</div>
+                          <div className="text-xl font-bold text-foreground">{selectedCoinData?.cap || '--'}</div>
+                        </div>
+                        <div>
+                          <div className="text-sm text-muted-foreground mb-1">Volume (24h)</div>
+                          <div className="text-xl font-bold text-foreground">{selectedCoinData?.vol || '--'}</div>
+                        </div>
+                        <div>
+                          <div className="text-sm text-muted-foreground mb-1">Circulating Supply</div>
+                          <div className="text-xl font-bold text-foreground">{selectedCoinData?.supply || '--'}</div>
+                        </div>
+                      </CardContent>
+                    </Card>
+
+                    <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
+                      <CardHeader>
+                        <div className="flex items-center justify-between">
+                          <div>
+                            <CardTitle>Trading Configuration</CardTitle>
+                            <CardDescription>Configure your trading strategy and parameters</CardDescription>
                           </div>
-                          <div className="text-xs font-medium text-white mb-1">
-                            {getStrategyName(marketAnalysis.recommendedStrategy || selectedStrategy)}
+                          <div className="flex flex-col items-end gap-1">
+                            <Button
+                              onClick={() => handleAIAutoConfigure()}
+                              disabled={isAIConfiguring}
+                              className="bg-gradient-to-r from-purple-600 to-[#1DB954] hover:from-purple-700 hover:to-[#1AA34A] text-white font-bold px-4 py-2 rounded-lg shadow-lg shadow-purple-900/20 text-xs"
+                            >
+                              {isAIConfiguring ? (
+                                <span className="flex items-center gap-1.5"><RotateCcw className="w-3.5 h-3.5 animate-spin" /> Analyzing...</span>
+                              ) : (
+                                <span className="flex items-center gap-1.5"><Zap className="w-3.5 h-3.5" /> AI Auto-Configure</span>
+                              )}
+                            </Button>
+                            {aiLastAnalyzedAt && (
+                              <span className="text-[10px] text-muted-foreground font-mono">
+                                Last: {aiLastAnalyzedAt.toLocaleTimeString()}
+                                {aiResult && <span className={`ml-1.5 font-bold ${aiResult.confidence >= 70 ? 'text-green-400' : aiResult.confidence >= 50 ? 'text-yellow-400' : 'text-red-400'}`}>{aiResult.confidence}% conf.</span>}
+                              </span>
+                            )}
+                            {pendingAiSuggestion && (
+                              <button
+                                onClick={applyPendingSuggestion}
+                                className="text-[10px] text-purple-400 hover:text-purple-300 underline cursor-pointer"
+                              >
+                                ✨ New AI suggestions available — click to apply
+                              </button>
+                            )}
                           </div>
-                          <div className="text-[10px] text-gray-300 leading-tight">
-                            {marketAnalysis.reasoning}
+                        </div>
+                        {aiResult && aiResult.backtestResult && aiResult.backtestResult.totalTrades > 0 && (
+                          <div className="mt-2 px-3 py-1.5 bg-black/40 rounded-md border border-[#333]/30 text-xs text-muted-foreground font-mono flex items-center gap-3">
+                            <span>📊 Backtest: <span className={aiResult.backtestResult.winRate >= 50 ? 'text-green-400' : 'text-red-400'}>{aiResult.backtestResult.winRate.toFixed(0)}% win rate</span></span>
+                            <span>• {aiResult.backtestResult.totalTrades} trades</span>
+                            <span>• PF {aiResult.backtestResult.profitFactor.toFixed(1)}</span>
+                            <span className="text-[9px] text-muted-foreground/60">(incl. 0.1% slippage)</span>
                           </div>
-                          {debugIndicators?.riskMult !== 1 && (
-                            <div className="mt-1 pt-1 border-t border-purple-800 text-[9px] text-yellow-300 flex justify-between">
-                              <span>Dynamic Size:</span>
-                              <span>{debugIndicators?.riskMult}x</span>
+                        )}
+                      </CardHeader>
+                      <CardContent className="space-y-6">
+                        {/* Strategy Selection */}
+                        <div>
+                          <label className="text-sm font-medium mb-2 block">
+                            Trading Strategy
+                            {aiRecommendedFields.has('strategy') && (
+                              <span title={aiResult?.reasoning.strategy} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                                AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                              </span>
+                            )}
+                          </label>
+                          <select
+                            value={selectedStrategy}
+                            onChange={(e) => { setSelectedStrategy(e.target.value); markManualOverride('strategy') }}
+                            className="w-full px-3 py-2 border rounded-md bg-background"
+                          >
+                            <option value="MA_CROSSOVER">Moving Average Crossover - SMA 20/50/200 (Golden/Death Cross)</option>
+                            <option value="MACD">MACD Strategy - Momentum-based crossovers</option>
+                            <option value="MEAN_REVERSION">Mean Reversion - Bollinger Bands + RSI (Oversold/Overbought)</option>
+                            <option value="GRID">Grid Trading - Fixed intervals for oscillations</option>
+                            <option value="MULTI_SIGNAL">Multi-Signal Ensemble - Voting system combining all strategies</option>
+                            <option disabled>--- New Strategies ---</option>
+                            <option value="RSI_DIVERGENCE">RSI Divergence - High Win-Rate Reversals</option>
+                            <option value="BOLLINGER_BREAKOUT">Bollinger Breakout - Explosive Volatility Moves</option>
+                            <option value="VWAP_TREND">VWAP Trend - Institutional Trend Following</option>
+                            <option value="ICHIMOKU">Ichimoku Cloud - Japanese Trend Reliability</option>
+                            <option value="PIVOT_REVERSAL">Pivot Reversal - Daily Support/Resistance</option>
+                          </select>
+                          <p className="text-xs text-muted-foreground mt-1">
+                            {selectedStrategy === "MA_CROSSOVER" && "Best for: Trending markets with clear direction"}
+                            {selectedStrategy === "MACD" && "Best for: Momentum trading and trend changes"}
+                            {selectedStrategy === "MEAN_REVERSION" && "Best for: Range-bound and ranging markets"}
+                            {selectedStrategy === "GRID" && "Best for: Volatile and range-bound markets"}
+                            {selectedStrategy === "MULTI_SIGNAL" && "Best for: All market conditions (recommended)"}
+                          </p>
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                          {/* Trading Pair with Search */}
+                          <div className="relative">
+                            <label className="text-sm font-medium mb-2 block">Trading Pair</label>
+                            <input
+                              type="text"
+                              value={searchTerm}
+                              onChange={(e) => {
+                                setSearchTerm(e.target.value.toUpperCase())
+                                setShowPairSearch(true)
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter') {
+                                  setSelectedSymbol(searchTerm)
+                                  setShowPairSearch(false)
+                                }
+                              }}
+                              onFocus={() => setShowPairSearch(true)}
+                              onBlur={() => setTimeout(() => setShowPairSearch(false), 200)}
+                              placeholder="Search pairs (e.g., BTCUSDT)"
+                              className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
+                            />
+                            {showPairSearch && filteredPairs.length > 0 && (
+                              <div className="absolute z-10 w-full mt-1 bg-background border rounded-md shadow-lg max-h-60 overflow-y-auto">
+                                {filteredPairs.map((pair) => (
+                                  <button
+                                    key={pair}
+                                    onClick={() => {
+                                      setSelectedSymbol(pair)
+                                      setSearchTerm(pair)
+                                      setShowPairSearch(false)
+                                    }}
+                                    className="w-full px-3 py-2 text-left hover:bg-muted transition-colors"
+                                  >
+                                    {pair}
+                                  </button>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+
+                          {/* Timeframe */}
+                          <div>
+                            <label className="text-sm font-medium mb-2 block">
+                              Timeframe
+                              {aiRecommendedFields.has('timeframe') && (
+                                <span title={aiResult?.reasoning.timeframe} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                                  AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                                </span>
+                              )}
+                            </label>
+                            <select
+                              value={selectedTimeframe}
+                              onChange={(e) => { setSelectedTimeframe(e.target.value); markManualOverride('timeframe') }}
+                              className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
+                            >
+                              <option value="1m">1 Minute</option>
+                              <option value="5m">5 Minutes</option>
+                              <option value="15m">15 Minutes</option>
+                              <option value="1h">1 Hour</option>
+                              <option value="4h">4 Hours</option>
+                              <option value="1d">1 Day</option>
+                            </select>
+                          </div>
+                        </div>
+
+                        {/* Risk Settings */}
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <label className="text-sm font-medium mb-2 block">
+                              Risk Per Trade (%)
+                              {aiRecommendedFields.has('riskPerTrade') && (
+                                <span title={aiResult?.reasoning.risk} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                                  AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                                </span>
+                              )}
+                            </label>
+                            <input
+                              type="number"
+                              min="0.5"
+                              max="10"
+                              step="0.5"
+                              value={riskPerTrade}
+                              onChange={(e) => {
+                                const val = parseFloat(e.target.value)
+                                setRiskPerTrade(isNaN(val) ? 0 : val)
+                                markManualOverride('riskPerTrade')
+                              }}
+                              className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
+                            />
+                            <p className="text-xs text-muted-foreground mt-1">Recommended: 1-3%</p>
+                          </div>
+
+                          <div>
+                            <label className="text-sm font-medium mb-2 block">
+                              Max Positions
+                              {aiRecommendedFields.has('maxPositions') && (
+                                <span title={aiResult?.reasoning.maxPositions} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                                  AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                                </span>
+                              )}
+                            </label>
+                            <input
+                              type="number"
+                              min="1"
+                              max="20"
+                              value={maxPositions}
+                              onChange={(e) => {
+                                const val = parseInt(e.target.value)
+                                setMaxPositions(isNaN(val) ? 1 : val)
+                                markManualOverride('maxPositions')
+                              }}
+                              className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
+                            />
+                          </div>
+                        </div>
+
+                        {/* Advanced Risk Management */}
+                        <div className="pt-4 border-t">
+                          <h4 className="text-sm font-semibold mb-3">Advanced Risk Management</h4>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div>
+                              <label className="text-sm font-medium mb-2 block">
+                                Stop Loss (%)
+                                {aiRecommendedFields.has('stopLoss') && (
+                                  <span title={aiResult?.reasoning.stopLoss} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                                    AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                                  </span>
+                                )}
+                              </label>
+                              <input
+                                type="number"
+                                min="0.1"
+                                step="0.1"
+                                value={stopLoss}
+                                onChange={(e) => { setStopLoss(parseFloat(e.target.value) || 0); markManualOverride('stopLoss') }}
+                                className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
+                              />
+                            </div>
+                            <div>
+                              <label className="text-sm font-medium mb-2 block">
+                                Take Profit (%)
+                                {aiRecommendedFields.has('takeProfit') && (
+                                  <span title={aiResult?.reasoning.takeProfit} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                                    AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                                  </span>
+                                )}
+                              </label>
+                              <input
+                                type="number"
+                                min="0.1"
+                                step="0.1"
+                                value={takeProfit}
+                                onChange={(e) => { setTakeProfit(parseFloat(e.target.value) || 0); markManualOverride('takeProfit') }}
+                                className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
+                              />
+                            </div>
+                            <div>
+                              <label className="text-sm font-medium mb-2 block">
+                                Trailing Stop (%)
+                                {aiRecommendedFields.has('trailingStop') && (
+                                  <span title={aiResult?.reasoning.trailingStop} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                                    AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                                  </span>
+                                )}
+                              </label>
+                              <input
+                                type="number"
+                                min="0.1"
+                                step="0.1"
+                                value={trailingStop}
+                                onChange={(e) => { setTrailingStop(parseFloat(e.target.value) || 0); markManualOverride('trailingStop') }}
+                                className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
+                              />
+                              <p className="text-xs text-muted-foreground mt-1">Locks in profit as price rises</p>
+                            </div>
+                            <div>
+                              <label className="text-sm font-medium mb-2 block">
+                                Simulated Leverage (x)
+                                {aiRecommendedFields.has('leverage') && (
+                                  <span title={aiResult?.reasoning.leverage} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
+                                    AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
+                                  </span>
+                                )}
+                              </label>
+                              <select
+                                value={leverage}
+                                onChange={(e) => { setLeverage(parseInt(e.target.value)); markManualOverride('leverage') }}
+                                className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
+                              >
+                                <option value="1">1x (Spot)</option>
+                                <option value="2">2x</option>
+                                <option value="5">5x</option>
+                                <option value="10">10x (High Risk)</option>
+                              </select>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Current Configuration Summary */}
+                        <div className="pt-4 border-t bg-muted/30 rounded-lg p-4">
+                          <h4 className="text-sm font-semibold mb-2">Current Configuration</h4>
+                          <div className="grid grid-cols-2 gap-2 text-xs">
+                            <div>
+                              <span className="text-muted-foreground">Strategy:</span>
+                              <span className="ml-2 font-medium">
+                                {getStrategyName(selectedStrategy)}
+                              </span>
+                            </div>
+                            <div>
+                              <span className="text-muted-foreground">Pair:</span>
+                              <span className="ml-2 font-medium">{selectedSymbol}</span>
+                            </div>
+                            <div>
+                              <span className="text-muted-foreground">Timeframe:</span>
+                              <span className="ml-2 font-medium">{selectedTimeframe}</span>
+                            </div>
+                            <div>
+                              <span className="text-muted-foreground">Risk:</span>
+                              <span className="ml-2 font-medium">{riskPerTrade}%</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Configuration Presets */}
+                        <div className="pt-4 border-t">
+                          <div className="flex items-center justify-between mb-3">
+                            <h4 className="text-sm font-semibold">Configuration Presets</h4>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => setShowPresets(!showPresets)}
+                            >
+                              {showPresets ? "Hide" : "Show"} Presets ({Object.keys(savedPresets).length})
+                            </Button>
+                          </div>
+
+                          {showPresets && (
+                            <div className="space-y-4">
+                              {/* Save as Preset */}
+                              <div className="flex gap-2">
+                                <input
+                                  type="text"
+                                  placeholder="Enter preset name..."
+                                  value={presetName}
+                                  onChange={(e) => setPresetName(e.target.value)}
+                                  onKeyDown={(e) => e.key === 'Enter' && handleSaveAsPreset()}
+                                  className="flex-1 px-3 py-2 text-sm border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
+                                />
+                                <Button size="sm" onClick={handleSaveAsPreset}>
+                                  Save as Preset
+                                </Button>
+                              </div>
+
+                              {/* Saved Presets List */}
+                              {Object.keys(savedPresets).length > 0 ? (
+                                <div className="space-y-2">
+                                  <p className="text-xs text-muted-foreground">Saved Presets:</p>
+                                  {Object.entries(savedPresets).map(([name, config]) => (
+                                    <div
+                                      key={name}
+                                      className="flex items-center justify-between p-3 bg-muted/30 rounded-lg"
+                                    >
+                                      <div className="flex-1">
+                                        <p className="font-medium text-sm">{name}</p>
+                                        <p className="text-xs text-muted-foreground">
+                                          {config.symbol} • {config.timeframe} • {config.strategy.replace('_', ' ')} • {config.riskPerTrade}%
+                                        </p>
+                                      </div>
+                                      <div className="flex gap-2">
+                                        <Button
+                                          size="sm"
+                                          variant="outline"
+                                          onClick={() => handleLoadPreset(name)}
+                                        >
+                                          Load
+                                        </Button>
+                                        <Button
+                                          size="sm"
+                                          variant="outline"
+                                          onClick={() => handleDeletePreset(name)}
+                                          className="text-red-600 hover:text-red-700"
+                                        >
+                                          Delete
+                                        </Button>
+                                      </div>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : (
+                                <p className="text-sm text-muted-foreground text-center py-4">
+                                  No saved presets yet. Create one above!
+                                </p>
+                              )}
                             </div>
                           )}
                         </div>
-                      )}
-                    </div>
-                  )}
-                </CardContent>
-              </Card>
 
-              {/* Equity Curve */}
-              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
-                <CardHeader>
-                  <CardTitle>Equity Curve</CardTitle>
-                  <CardDescription>Account balance over time</CardDescription>
-                </CardHeader>
-                <CardContent>
-                  <ResponsiveContainer width="100%" height={300}>
-                    <LineChart data={balanceHistory}>
-                      <CartesianGrid strokeDasharray="3 3" stroke="#333" opacity={0.3} />
-                      <XAxis dataKey="time" stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
-                      <YAxis stroke="#666" fontSize={12} tickLine={false} axisLine={false} tickFormatter={(value) => `$${value}`} />
-                      <Tooltip contentStyle={{ backgroundColor: "#1A1A1A", border: "1px solid #333", color: "#EAEAEA" }} />
-                      <Line
-                        type="monotone"
-                        dataKey="balance"
-                        stroke="#10b981"
-                        strokeWidth={2}
-                        dot={false}
-                      />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </CardContent>
-              </Card>
-            </div>
+                        <div className="pt-4 border-t flex gap-2">
+                          <Button variant="outline" className="flex-1 bg-transparent">
+                            Reset to Defaults
+                          </Button>
+                          <Button className="flex-1" onClick={handleSaveConfiguration}>Save Configuration</Button>
+                        </div>
 
-            {/* Active Trades */}
-            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
-              <CardHeader>
-                <CardTitle className="flex items-center">
-                  <Zap className="w-4 h-4 mr-2 text-yellow-500" />
-                  Active Positions ({openTrades.length})
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                {openTrades.length === 0 ? (
-                  <p className="text-muted-foreground text-center py-8">No open positions</p>
-                ) : (
-                  <div className="space-y-2 max-h-64 overflow-y-auto">
-                    {openTrades.map((trade) => (
-                      <div key={trade.id} className="flex items-center justify-between p-3 bg-muted rounded-lg">
-                        <div className="flex items-center gap-3">
-                          <Badge variant={trade.side === "BUY" ? "default" : "destructive"}>
-                            {trade.side}
-                          </Badge>
-                          <div>
-                            <p className="font-medium">{trade.symbol}</p>
-                            <p className="text-sm text-muted-foreground">${trade.entryPrice.toFixed(2)}</p>
+                        {/* Finalize Launch Execution within Configuration Module */}
+                        <div className="pt-8 mt-8 border-t border-[#333]/50">
+                          <div className="bg-black/60 border border-[#333]/50 rounded-xl p-6 relative overflow-hidden">
+                            {/* Decorative Background Glow */}
+                            <div className="absolute top-0 right-0 w-32 h-32 bg-[#1DB954]/10 rounded-full blur-3xl pointer-events-none" />
+
+                            <h4 className="text-sm font-bold uppercase tracking-wider mb-2 text-[#1DB954] flex items-center gap-2">
+                              <Zap className="w-4 h-4" /> Finalize & Engine Launch
+                            </h4>
+                            <p className="text-xs text-muted-foreground mb-6">Review your configuration matrix above. Only launch the strategy after you have verified your capital exposure limits and active trading pair selections.</p>
+
+                            <div className="flex flex-col sm:flex-row gap-4 items-center relative z-10">
+                              <Button
+                                onClick={() => setIsRunning(!isRunning)}
+                                disabled={isSafetyLocked}
+                                className={isRunning
+                                  ? "w-full sm:flex-1 bg-red-600 hover:bg-red-700 font-bold py-6 text-lg shadow-lg shadow-red-900/20"
+                                  : "w-full sm:flex-1 bg-[#1DB954] hover:bg-[#1AA34A] text-white font-bold py-6 text-lg shadow-lg shadow-[#1DB954]/20"}
+                              >
+                                {isRunning ? (<span className="flex items-center"><Pause className="w-5 h-5 mr-2" /> STOP ENGINE</span>) : (<span className="flex items-center"><Play className="w-5 h-5 mr-2" /> LAUNCH ALGORITHMIC ENGINE</span>)}
+                              </Button>
+
+                              {isSafetyLocked ? (
+                                <Button
+                                  variant="outline"
+                                  className="w-full sm:w-auto py-6 px-6 font-bold border-yellow-500 text-yellow-500 bg-yellow-500/5 hover:bg-yellow-500/10"
+                                  onClick={() => {
+                                    riskManagerRef.current.resetSafety();
+                                    setIsSafetyLocked(false);
+                                    setSafetyReason(null);
+                                    toast({ title: "Safety Override", description: "System safety locks have been reset manually." });
+                                  }}
+                                >
+                                  <Unlock className="w-5 h-5 mr-2" />
+                                  RESET LOCKS
+                                </Button>
+                              ) : (
+                                <Button
+                                  variant="destructive"
+                                  className="w-full sm:w-auto py-6 px-6 font-bold bg-red-900/80 hover:bg-red-900 border border-red-700 shadow-lg"
+                                  onClick={() => {
+                                    riskManagerRef.current.triggerKillSwitch();
+                                    setIsSafetyLocked(true);
+                                    setSafetyReason("Manual Kill Switch Triggered");
+                                    setIsRunning(false);
+
+                                    const exitPrice = currentPrice;
+                                    let totalLiquidationPnL = 0;
+
+                                    setTrades(prevTrades => prevTrades.map(t => {
+                                      if (t.status === 'OPEN') {
+                                        const pnl = t.side === "BUY"
+                                          ? (exitPrice - t.entryPrice) * t.quantity
+                                          : (t.entryPrice - exitPrice) * t.quantity;
+                                        totalLiquidationPnL += pnl;
+                                        return { ...t, status: 'CLOSED', exitPrice, exitTime: Date.now(), pnl, exitReason: "KILL SWITCH 💀" };
+                                      }
+                                      return t;
+                                    }));
+
+                                    setPortfolio(prev => ({
+                                      ...prev,
+                                      equity: prev.equity + totalLiquidationPnL,
+                                      totalPnL: prev.totalPnL + totalLiquidationPnL,
+                                      realizedPnL: prev.realizedPnL + totalLiquidationPnL,
+                                      unrealizedPnL: 0
+                                    }));
+
+                                    toast({ title: "🟥 KILL SWITCH ACTIVATED", description: `Trading halted. All positions liquidated at $${exitPrice}.`, duration: 5000 });
+                                  }}
+                                >
+                                  <Skull className="w-5 h-5 mr-2" />
+                                  KILL SWITCH
+                                </Button>
+                              )}
+                            </div>
                           </div>
                         </div>
-                        <div className="text-right">
-                          <p className="font-medium">{trade.quantity.toFixed(4)}</p>
-                          <Badge variant="outline" className="text-yellow-600">
-                            <Clock className="w-3 h-3 mr-1" />
-                            Open
-                          </Badge>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          </TabsContent>
-
-          {/* Data Tab */}
-          <TabsContent value="data" className="space-y-4 mt-4">
-            
-            {/* SDP Quantitative Metrics Headway Card */}
-            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
-              <CardHeader className="pb-2">
-                <CardTitle className="flex items-center gap-2 text-lg text-[#1DB954]">
-                  <Database className="w-5 h-5" />
-                  Quantitative Metrics (SDP)
-                </CardTitle>
-                <CardDescription>Live mathematical model encodings for active market conditions.</CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-2">
-                  <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30 flex flex-col justify-between">
-                    <div>
-                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Topological Data Analysis</div>
-                      <div className="text-lg font-bold text-foreground">Regime Encoding</div>
-                    </div>
-                    <div className="mt-4 pt-4 border-t border-[#333]/50 space-y-2 text-sm font-mono">
-                      <div className="flex justify-between items-center"><span className="text-muted-foreground">Components (β₀):</span> <span className="text-foreground">12</span></div>
-                      <div className="flex justify-between items-center"><span className="text-muted-foreground">Loops (β₁):</span> <span className="text-foreground">3</span></div>
-                      <div className="flex justify-between items-center"><span className="text-muted-foreground">Voids (β₂):</span> <span className="text-foreground">0</span></div>
-                    </div>
-                  </div>
-                  
-                  <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30 flex flex-col justify-between">
-                    <div>
-                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Stationarity Protocol</div>
-                      <div className="text-lg font-bold text-foreground">Fractional Diff (d=0.4)</div>
-                    </div>
-                    <div className="mt-4 pt-4 border-t border-[#333]/50 text-sm">
-                      <div className="flex justify-center items-center gap-2 mb-3">
-                        <span className="relative flex h-2.5 w-2.5"><span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-[#1DB954] opacity-75"></span><span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-[#1DB954]"></span></span>
-                        <span className="font-bold text-foreground tracking-wide">STATIONARITY ACH.</span>
-                      </div>
-                      <p className="text-muted-foreground text-center text-xs">ADF Test p-value: <span className="text-white font-mono">0.014</span> (&lt; 0.05)</p>
-                    </div>
-                  </div>
-
-                  <div className="p-4 bg-black/40 rounded-lg border border-[#333]/30 flex flex-col justify-between">
-                    <div>
-                      <div className="text-[#1DB954] text-xs font-bold uppercase tracking-wider mb-1">Risk Bounds</div>
-                      <div className="text-lg font-bold text-foreground">VaR & Expected Shortfall</div>
-                    </div>
-                    <div className="mt-4 pt-4 border-t border-[#333]/50 space-y-2 text-sm font-mono">
-                      <div className="flex justify-between items-center"><span className="text-muted-foreground">VaR (95%):</span> <span className="text-red-400 font-bold">-2.40%</span></div>
-                      <div className="flex justify-between items-center"><span className="text-muted-foreground">CVaR (95%):</span> <span className="text-red-500 font-bold">-3.85%</span></div>
-                      <div className="w-full bg-[#333]/50 h-1.5 rounded-full overflow-hidden flex mt-2"><div className="w-[85%] bg-blue-500/50 h-full"></div><div className="w-[15%] bg-red-500 h-full"></div></div>
-                    </div>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-
-            <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
-              <CardHeader>
-                <CardTitle className="flex items-center">
-                  <CheckCircle className="w-4 h-4 mr-2 text-green-500" />
-                  Closed Trades ({closedTrades.length})
-                </CardTitle>
-              </CardHeader>
-              <CardContent>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead className="bg-muted">
-                      <tr>
-                        <th className="px-4 py-2 text-left">Symbol</th>
-                        <th className="px-4 py-2 text-left">Side</th>
-                        <th className="px-4 py-2 text-left">Entry</th>
-                        <th className="px-4 py-2 text-left">Exit</th>
-                        <th className="px-4 py-2 text-left">Qty</th>
-                        <th className="px-4 py-2 text-right">PnL</th>
-                        <th className="px-4 py-2 text-right">%</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {closedTrades.slice(0, 20).map((trade) => (
-                        <tr key={trade.id} className="border-t hover:bg-muted">
-                          <td className="px-4 py-2">{trade.symbol}</td>
-                          <td className="px-4 py-2">
-                            <Badge variant={trade.side === "BUY" ? "default" : "destructive"}>
-                              {trade.side}
-                            </Badge>
-                          </td>
-                          <td className="px-4 py-2">${trade.entryPrice.toFixed(2)}</td>
-                          <td className="px-4 py-2">${(trade.exitPrice || 0).toFixed(2)}</td>
-                          <td className="px-4 py-2">{trade.quantity.toFixed(4)}</td>
-                          <td className={`px-4 py-2 text-right ${(trade.pnl || 0) > 0 ? "text-green-500" : "text-red-500"}`}>
-                            ${(trade.pnl || 0).toFixed(2)}
-                          </td>
-                          <td className={`px-4 py-2 text-right ${(trade.pnlPercent || 0) > 0 ? "text-green-500" : "text-red-500"}`}>
-                            {(trade.pnlPercent || 0).toFixed(2)}%
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </CardContent>
-            </Card>
-            </div>
-          {/* Analytics Section inside Data Tab */}
-          <div className="space-y-4 mt-6">
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
-                <CardHeader>
-                  <CardTitle>Trade Distribution</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <ResponsiveContainer width="100%" height={300}>
-                    <BarChart
-                      data={[
-                        { name: "Wins", value: closedTrades.filter((t) => (t.pnl || 0) > 0).length },
-                        { name: "Losses", value: closedTrades.filter((t) => (t.pnl || 0) < 0).length },
-                      ]}
-                    >
-                      <CartesianGrid strokeDasharray="3 3" stroke="#333" opacity={0.3} />
-                      <XAxis dataKey="name" stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
-                      <YAxis stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
-                      <Tooltip contentStyle={{ backgroundColor: "#1A1A1A", border: "1px solid #333", color: "#EAEAEA" }} />
-                      <Bar dataKey="value" fill="#3b82f6" />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </CardContent>
-              </Card>
-
-              <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
-                <CardHeader>
-                  <CardTitle>PnL Distribution</CardTitle>
-                </CardHeader>
-                <CardContent>
-                  <ResponsiveContainer width="100%" height={300}>
-                    <BarChart
-                      data={closedTrades
-                        .slice(0, 10)
-                        .map((t, i) => ({
-                          name: `Trade ${i + 1}`,
-                          pnl: t.pnl || 0,
-                        }))}
-                    >
-                      <CartesianGrid strokeDasharray="3 3" stroke="#333" opacity={0.3} />
-                      <XAxis dataKey="name" stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
-                      <YAxis stroke="#666" fontSize={12} tickLine={false} axisLine={false} />
-                      <Tooltip contentStyle={{ backgroundColor: "#1A1A1A", border: "1px solid #333", color: "#EAEAEA" }} />
-                      <Bar
-                        dataKey="pnl"
-                        fill="#3b82f6"
-                        style={{ background: "#3b82f6" }}
-                      />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </CardContent>
-              </Card>
-            </div>
-          </div>
-        </TabsContent>
-
-          {/* Square Tab (Gemini Advisor integration point) */}
-          <TabsContent value="square" className="space-y-4 mt-4">
-             <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg p-6 flex flex-col items-center justify-center text-center min-h-[400px]">
-               <Brain className="w-16 h-16 text-purple-500 mb-4 animate-pulse" />
-               <h3 className="text-2xl font-bold text-white mb-2">Square Intelligence</h3>
-               <p className="text-muted-foreground mb-6 max-w-md">Connect with the Gemini Neural Network to generate market sentiment, backtesting signals, and auto-tuning boundaries.</p>
-               <Button onClick={handleAskGemini} disabled={isLoadingAdvice} className="bg-purple-600 hover:bg-purple-700 text-white font-bold py-6 px-8 rounded-xl shadow-lg shadow-purple-900/50">
-                 {isLoadingAdvice ? "Analyzing..." : "Generate Square Analysis"}
-               </Button>
-             </Card>
-          </TabsContent>
-
-          {/* Info Tab (Settings + Scenarios) */}
-          <TabsContent value="info" className="space-y-4 mt-4">
-            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg mb-6">
-                <CardHeader>
-                  <CardTitle className="text-lg flex items-center gap-2">
-                    <Activity className="w-5 h-5 text-[#1DB954]" />
-                    Market Scenarios
-                  </CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-4 grid grid-cols-3">
-                  <div>
-                    <div className="text-sm text-muted-foreground mb-1">Market Cap</div>
-                    <div className="text-xl font-bold text-foreground">{selectedCoinData?.cap || '--'}</div>
-                  </div>
-                  <div>
-                    <div className="text-sm text-muted-foreground mb-1">Volume (24h)</div>
-                    <div className="text-xl font-bold text-foreground">{selectedCoinData?.vol || '--'}</div>
-                  </div>
-                  <div>
-                    <div className="text-sm text-muted-foreground mb-1">Circulating Supply</div>
-                    <div className="text-xl font-bold text-foreground">{selectedCoinData?.supply || '--'}</div>
-                  </div>
-                </CardContent>
-            </Card>
-            
-            <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg">
-              <CardHeader>
-                <div className="flex items-center justify-between">
-                  <div>
-                    <CardTitle>Trading Configuration</CardTitle>
-                    <CardDescription>Configure your trading strategy and parameters</CardDescription>
-                  </div>
-                  <div className="flex flex-col items-end gap-1">
-                    <Button
-                      onClick={() => handleAIAutoConfigure()}
-                      disabled={isAIConfiguring}
-                      className="bg-gradient-to-r from-purple-600 to-[#1DB954] hover:from-purple-700 hover:to-[#1AA34A] text-white font-bold px-4 py-2 rounded-lg shadow-lg shadow-purple-900/20 text-xs"
-                    >
-                      {isAIConfiguring ? (
-                        <span className="flex items-center gap-1.5"><RotateCcw className="w-3.5 h-3.5 animate-spin" /> Analyzing...</span>
-                      ) : (
-                        <span className="flex items-center gap-1.5"><Zap className="w-3.5 h-3.5" /> AI Auto-Configure</span>
-                      )}
-                    </Button>
-                    {aiLastAnalyzedAt && (
-                      <span className="text-[10px] text-muted-foreground font-mono">
-                        Last: {aiLastAnalyzedAt.toLocaleTimeString()}
-                        {aiResult && <span className={`ml-1.5 font-bold ${aiResult.confidence >= 70 ? 'text-green-400' : aiResult.confidence >= 50 ? 'text-yellow-400' : 'text-red-400'}`}>{aiResult.confidence}% conf.</span>}
-                      </span>
-                    )}
-                    {pendingAiSuggestion && (
-                      <button
-                        onClick={applyPendingSuggestion}
-                        className="text-[10px] text-purple-400 hover:text-purple-300 underline cursor-pointer"
-                      >
-                        ✨ New AI suggestions available — click to apply
-                      </button>
-                    )}
-                  </div>
-                </div>
-                {aiResult && aiResult.backtestResult && aiResult.backtestResult.totalTrades > 0 && (
-                  <div className="mt-2 px-3 py-1.5 bg-black/40 rounded-md border border-[#333]/30 text-xs text-muted-foreground font-mono flex items-center gap-3">
-                    <span>📊 Backtest: <span className={aiResult.backtestResult.winRate >= 50 ? 'text-green-400' : 'text-red-400'}>{aiResult.backtestResult.winRate.toFixed(0)}% win rate</span></span>
-                    <span>• {aiResult.backtestResult.totalTrades} trades</span>
-                    <span>• PF {aiResult.backtestResult.profitFactor.toFixed(1)}</span>
-                    <span className="text-[9px] text-muted-foreground/60">(incl. 0.1% slippage)</span>
-                  </div>
-                )}
-              </CardHeader>
-              <CardContent className="space-y-6">
-                {/* Strategy Selection */}
-                <div>
-                  <label className="text-sm font-medium mb-2 block">
-                    Trading Strategy
-                    {aiRecommendedFields.has('strategy') && (
-                      <span title={aiResult?.reasoning.strategy} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-                        AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
-                      </span>
-                    )}
-                  </label>
-                  <select
-                    value={selectedStrategy}
-                    onChange={(e) => { setSelectedStrategy(e.target.value); markManualOverride('strategy') }}
-                    className="w-full px-3 py-2 border rounded-md bg-background"
-                  >
-                    <option value="MA_CROSSOVER">Moving Average Crossover - SMA 20/50/200 (Golden/Death Cross)</option>
-                    <option value="MACD">MACD Strategy - Momentum-based crossovers</option>
-                    <option value="MEAN_REVERSION">Mean Reversion - Bollinger Bands + RSI (Oversold/Overbought)</option>
-                    <option value="GRID">Grid Trading - Fixed intervals for oscillations</option>
-                    <option value="MULTI_SIGNAL">Multi-Signal Ensemble - Voting system combining all strategies</option>
-                    <option disabled>--- New Strategies ---</option>
-                    <option value="RSI_DIVERGENCE">RSI Divergence - High Win-Rate Reversals</option>
-                    <option value="BOLLINGER_BREAKOUT">Bollinger Breakout - Explosive Volatility Moves</option>
-                    <option value="VWAP_TREND">VWAP Trend - Institutional Trend Following</option>
-                    <option value="ICHIMOKU">Ichimoku Cloud - Japanese Trend Reliability</option>
-                    <option value="PIVOT_REVERSAL">Pivot Reversal - Daily Support/Resistance</option>
-                  </select>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    {selectedStrategy === "MA_CROSSOVER" && "Best for: Trending markets with clear direction"}
-                    {selectedStrategy === "MACD" && "Best for: Momentum trading and trend changes"}
-                    {selectedStrategy === "MEAN_REVERSION" && "Best for: Range-bound and ranging markets"}
-                    {selectedStrategy === "GRID" && "Best for: Volatile and range-bound markets"}
-                    {selectedStrategy === "MULTI_SIGNAL" && "Best for: All market conditions (recommended)"}
-                  </p>
-                </div>
-
-                <div className="grid grid-cols-2 gap-4">
-                  {/* Trading Pair with Search */}
-                  <div className="relative">
-                    <label className="text-sm font-medium mb-2 block">Trading Pair</label>
-                    <input
-                      type="text"
-                      value={searchTerm}
-                      onChange={(e) => {
-                        setSearchTerm(e.target.value.toUpperCase())
-                        setShowPairSearch(true)
-                      }}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          setSelectedSymbol(searchTerm)
-                          setShowPairSearch(false)
-                        }
-                      }}
-                      onFocus={() => setShowPairSearch(true)}
-                      onBlur={() => setTimeout(() => setShowPairSearch(false), 200)}
-                      placeholder="Search pairs (e.g., BTCUSDT)"
-                      className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
-                    />
-                    {showPairSearch && filteredPairs.length > 0 && (
-                      <div className="absolute z-10 w-full mt-1 bg-background border rounded-md shadow-lg max-h-60 overflow-y-auto">
-                        {filteredPairs.map((pair) => (
-                          <button
-                            key={pair}
-                            onClick={() => {
-                              setSelectedSymbol(pair)
-                              setSearchTerm(pair)
-                              setShowPairSearch(false)
-                            }}
-                            className="w-full px-3 py-2 text-left hover:bg-muted transition-colors"
-                          >
-                            {pair}
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-
-                  {/* Timeframe */}
-                  <div>
-                    <label className="text-sm font-medium mb-2 block">
-                      Timeframe
-                      {aiRecommendedFields.has('timeframe') && (
-                        <span title={aiResult?.reasoning.timeframe} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-                          AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
-                        </span>
-                      )}
-                    </label>
-                    <select
-                      value={selectedTimeframe}
-                      onChange={(e) => { setSelectedTimeframe(e.target.value); markManualOverride('timeframe') }}
-                      className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
-                    >
-                      <option value="1m">1 Minute</option>
-                      <option value="5m">5 Minutes</option>
-                      <option value="15m">15 Minutes</option>
-                      <option value="1h">1 Hour</option>
-                      <option value="4h">4 Hours</option>
-                      <option value="1d">1 Day</option>
-                    </select>
-                  </div>
-                </div>
-
-                {/* Risk Settings */}
-                <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="text-sm font-medium mb-2 block">
-                      Risk Per Trade (%)
-                      {aiRecommendedFields.has('riskPerTrade') && (
-                        <span title={aiResult?.reasoning.risk} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-                          AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
-                        </span>
-                      )}
-                    </label>
-                    <input
-                      type="number"
-                      min="0.5"
-                      max="10"
-                      step="0.5"
-                      value={riskPerTrade}
-                      onChange={(e) => {
-                        const val = parseFloat(e.target.value)
-                        setRiskPerTrade(isNaN(val) ? 0 : val)
-                        markManualOverride('riskPerTrade')
-                      }}
-                      className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
-                    />
-                    <p className="text-xs text-muted-foreground mt-1">Recommended: 1-3%</p>
-                  </div>
-
-                  <div>
-                    <label className="text-sm font-medium mb-2 block">
-                      Max Positions
-                      {aiRecommendedFields.has('maxPositions') && (
-                        <span title={aiResult?.reasoning.maxPositions} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-                          AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
-                        </span>
-                      )}
-                    </label>
-                    <input
-                      type="number"
-                      min="1"
-                      max="20"
-                      value={maxPositions}
-                      onChange={(e) => {
-                        const val = parseInt(e.target.value)
-                        setMaxPositions(isNaN(val) ? 1 : val)
-                        markManualOverride('maxPositions')
-                      }}
-                      className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
-                    />
-                  </div>
-                </div>
-
-                {/* Advanced Risk Management */}
-                <div className="pt-4 border-t">
-                  <h4 className="text-sm font-semibold mb-3">Advanced Risk Management</h4>
-                  <div className="grid grid-cols-2 gap-4">
-                    <div>
-                      <label className="text-sm font-medium mb-2 block">
-                        Stop Loss (%)
-                        {aiRecommendedFields.has('stopLoss') && (
-                          <span title={aiResult?.reasoning.stopLoss} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-                            AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
-                          </span>
-                        )}
-                      </label>
-                      <input
-                        type="number"
-                        min="0.1"
-                        step="0.1"
-                        value={stopLoss}
-                        onChange={(e) => { setStopLoss(parseFloat(e.target.value) || 0); markManualOverride('stopLoss') }}
-                        className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-sm font-medium mb-2 block">
-                        Take Profit (%)
-                        {aiRecommendedFields.has('takeProfit') && (
-                          <span title={aiResult?.reasoning.takeProfit} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-                            AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
-                          </span>
-                        )}
-                      </label>
-                      <input
-                        type="number"
-                        min="0.1"
-                        step="0.1"
-                        value={takeProfit}
-                        onChange={(e) => { setTakeProfit(parseFloat(e.target.value) || 0); markManualOverride('takeProfit') }}
-                        className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-sm font-medium mb-2 block">
-                        Trailing Stop (%)
-                        {aiRecommendedFields.has('trailingStop') && (
-                          <span title={aiResult?.reasoning.trailingStop} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-                            AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
-                          </span>
-                        )}
-                      </label>
-                      <input
-                        type="number"
-                        min="0.1"
-                        step="0.1"
-                        value={trailingStop}
-                        onChange={(e) => { setTrailingStop(parseFloat(e.target.value) || 0); markManualOverride('trailingStop') }}
-                        className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
-                      />
-                      <p className="text-xs text-muted-foreground mt-1">Locks in profit as price rises</p>
-                    </div>
-                    <div>
-                      <label className="text-sm font-medium mb-2 block">
-                        Simulated Leverage (x)
-                        {aiRecommendedFields.has('leverage') && (
-                          <span title={aiResult?.reasoning.leverage} className={`ml-2 text-[10px] px-1.5 py-0.5 rounded-full cursor-help ${aiResult && aiResult.confidence >= 70 ? 'bg-green-500/20 text-green-400' : 'bg-yellow-500/20 text-yellow-400'}`}>
-                            AI {aiResult && aiResult.confidence >= 70 ? '✦' : '⚠'}
-                          </span>
-                        )}
-                      </label>
-                      <select
-                        value={leverage}
-                        onChange={(e) => { setLeverage(parseInt(e.target.value)); markManualOverride('leverage') }}
-                        className="w-full px-3 py-2 border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
-                      >
-                        <option value="1">1x (Spot)</option>
-                        <option value="2">2x</option>
-                        <option value="5">5x</option>
-                        <option value="10">10x (High Risk)</option>
-                      </select>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Current Configuration Summary */}
-                <div className="pt-4 border-t bg-muted/30 rounded-lg p-4">
-                  <h4 className="text-sm font-semibold mb-2">Current Configuration</h4>
-                  <div className="grid grid-cols-2 gap-2 text-xs">
-                    <div>
-                      <span className="text-muted-foreground">Strategy:</span>
-                      <span className="ml-2 font-medium">
-                        {getStrategyName(selectedStrategy)}
-                      </span>
-                    </div>
-                    <div>
-                      <span className="text-muted-foreground">Pair:</span>
-                      <span className="ml-2 font-medium">{selectedSymbol}</span>
-                    </div>
-                    <div>
-                      <span className="text-muted-foreground">Timeframe:</span>
-                      <span className="ml-2 font-medium">{selectedTimeframe}</span>
-                    </div>
-                    <div>
-                      <span className="text-muted-foreground">Risk:</span>
-                      <span className="ml-2 font-medium">{riskPerTrade}%</span>
-                    </div>
-                  </div>
-                </div>
-
-                {/* Configuration Presets */}
-                <div className="pt-4 border-t">
-                  <div className="flex items-center justify-between mb-3">
-                    <h4 className="text-sm font-semibold">Configuration Presets</h4>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setShowPresets(!showPresets)}
-                    >
-                      {showPresets ? "Hide" : "Show"} Presets ({Object.keys(savedPresets).length})
-                    </Button>
-                  </div>
-
-                  {showPresets && (
-                    <div className="space-y-4">
-                      {/* Save as Preset */}
-                      <div className="flex gap-2">
-                        <input
-                          type="text"
-                          placeholder="Enter preset name..."
-                          value={presetName}
-                          onChange={(e) => setPresetName(e.target.value)}
-                          onKeyDown={(e) => e.key === 'Enter' && handleSaveAsPreset()}
-                          className="flex-1 px-3 py-2 text-sm border border-[#333]/50 rounded-md bg-[#121212] text-foreground focus:border-[#1DB954]/50 focus:outline-none"
-                        />
-                        <Button size="sm" onClick={handleSaveAsPreset}>
-                          Save as Preset
-                        </Button>
-                      </div>
-
-                      {/* Saved Presets List */}
-                      {Object.keys(savedPresets).length > 0 ? (
-                        <div className="space-y-2">
-                          <p className="text-xs text-muted-foreground">Saved Presets:</p>
-                          {Object.entries(savedPresets).map(([name, config]) => (
-                            <div
-                              key={name}
-                              className="flex items-center justify-between p-3 bg-muted/30 rounded-lg"
-                            >
-                              <div className="flex-1">
-                                <p className="font-medium text-sm">{name}</p>
-                                <p className="text-xs text-muted-foreground">
-                                  {config.symbol} • {config.timeframe} • {config.strategy.replace('_', ' ')} • {config.riskPerTrade}%
-                                </p>
-                              </div>
-                              <div className="flex gap-2">
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={() => handleLoadPreset(name)}
-                                >
-                                  Load
-                                </Button>
-                                <Button
-                                  size="sm"
-                                  variant="outline"
-                                  onClick={() => handleDeletePreset(name)}
-                                  className="text-red-600 hover:text-red-700"
-                                >
-                                  Delete
-                                </Button>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <p className="text-sm text-muted-foreground text-center py-4">
-                          No saved presets yet. Create one above!
-                        </p>
-                      )}
-                    </div>
-                  )}
-                </div>
-
-                <div className="pt-4 border-t flex gap-2">
-                  <Button variant="outline" className="flex-1 bg-transparent">
-                    Reset to Defaults
-                  </Button>
-                  <Button className="flex-1" onClick={handleSaveConfiguration}>Save Configuration</Button>
-                </div>
-
-                {/* Finalize Launch Execution within Configuration Module */}
-                <div className="pt-8 mt-8 border-t border-[#333]/50">
-                  <div className="bg-black/60 border border-[#333]/50 rounded-xl p-6 relative overflow-hidden">
-                    {/* Decorative Background Glow */}
-                    <div className="absolute top-0 right-0 w-32 h-32 bg-[#1DB954]/10 rounded-full blur-3xl pointer-events-none" />
-                    
-                    <h4 className="text-sm font-bold uppercase tracking-wider mb-2 text-[#1DB954] flex items-center gap-2">
-                      <Zap className="w-4 h-4" /> Finalize & Engine Launch
-                    </h4>
-                    <p className="text-xs text-muted-foreground mb-6">Review your configuration matrix above. Only launch the strategy after you have verified your capital exposure limits and active trading pair selections.</p>
-                    
-                    <div className="flex flex-col sm:flex-row gap-4 items-center relative z-10">
-                      <Button
-                        onClick={() => setIsRunning(!isRunning)}
-                        disabled={isSafetyLocked}
-                        className={isRunning 
-                          ? "w-full sm:flex-1 bg-red-600 hover:bg-red-700 font-bold py-6 text-lg shadow-lg shadow-red-900/20" 
-                          : "w-full sm:flex-1 bg-[#1DB954] hover:bg-[#1AA34A] text-white font-bold py-6 text-lg shadow-lg shadow-[#1DB954]/20"}
-                      >
-                        {isRunning ? (<span className="flex items-center"><Pause className="w-5 h-5 mr-2" /> STOP ENGINE</span>) : (<span className="flex items-center"><Play className="w-5 h-5 mr-2" /> LAUNCH ALGORITHMIC ENGINE</span>)}
-                      </Button>
-
-                      {isSafetyLocked ? (
-                        <Button
-                          variant="outline"
-                          className="w-full sm:w-auto py-6 px-6 font-bold border-yellow-500 text-yellow-500 bg-yellow-500/5 hover:bg-yellow-500/10"
-                          onClick={() => {
-                            riskManagerRef.current.resetSafety();
-                            setIsSafetyLocked(false);
-                            setSafetyReason(null);
-                            toast({ title: "Safety Override", description: "System safety locks have been reset manually." });
-                          }}
-                        >
-                          <Unlock className="w-5 h-5 mr-2" />
-                          RESET LOCKS
-                        </Button>
-                      ) : (
-                        <Button
-                          variant="destructive"
-                          className="w-full sm:w-auto py-6 px-6 font-bold bg-red-900/80 hover:bg-red-900 border border-red-700 shadow-lg"
-                          onClick={() => {
-                            riskManagerRef.current.triggerKillSwitch();
-                            setIsSafetyLocked(true);
-                            setSafetyReason("Manual Kill Switch Triggered");
-                            setIsRunning(false);
-
-                            const exitPrice = currentPrice;
-                            let totalLiquidationPnL = 0;
-
-                            setTrades(prevTrades => prevTrades.map(t => {
-                              if (t.status === 'OPEN') {
-                                const pnl = t.side === "BUY"
-                                  ? (exitPrice - t.entryPrice) * t.quantity
-                                  : (t.entryPrice - exitPrice) * t.quantity;
-                                totalLiquidationPnL += pnl;
-                                return { ...t, status: 'CLOSED', exitPrice, exitTime: Date.now(), pnl, exitReason: "KILL SWITCH 💀" };
-                              }
-                              return t;
-                            }));
-
-                            setPortfolio(prev => ({
-                              ...prev,
-                              equity: prev.equity + totalLiquidationPnL,
-                              totalPnL: prev.totalPnL + totalLiquidationPnL,
-                              realizedPnL: prev.realizedPnL + totalLiquidationPnL,
-                              unrealizedPnL: 0
-                            }));
-
-                            toast({ title: "🟥 KILL SWITCH ACTIVATED", description: `Trading halted. All positions liquidated at $${exitPrice}.`, duration: 5000 });
-                          }}
-                        >
-                          <Skull className="w-5 h-5 mr-2" />
-                          KILL SWITCH
-                        </Button>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          </TabsContent>
-        </Tabs>
+                      </CardContent>
+                    </Card>
+                  </TabsContent>
+                </Tabs>
               </div>
 
               {/* Right Column: Market Activity & About Coin */}
               <div className="lg:col-span-2 space-y-6 flex flex-col h-[1200px]">
-                
+
                 {/* About Coin */}
                 <Card className="bg-[#1A1A1A]/80 backdrop-blur-md border-[#333]/50 shadow-lg shrink-0">
                   <CardHeader className="py-3 border-b border-[#333]/50">
                     <CardTitle className="text-sm font-bold text-foreground tracking-wide uppercase flex items-center gap-2">
-                       <span className="text-lg">{selectedCoinData?.logo || '🪙'}</span> About {selectedSymbol.replace('USDT','')}
+                      <span className="text-lg">{selectedCoinData?.logo || '🪙'}</span> About {selectedSymbol.replace('USDT', '')}
                     </CardTitle>
                   </CardHeader>
                   <CardContent className="p-4 text-xs text-muted-foreground leading-relaxed space-y-3">
                     <p>
-                      {selectedSymbol.replace('USDT','')} is a dynamic digital asset actively positioned on the global exchange network. It leverages cryptographic consensus mechanisms and high-throughput liquidity to enable automated algorithmic strategies.
+                      {selectedSymbol.replace('USDT', '')} is a dynamic digital asset actively positioned on the global exchange network. It leverages cryptographic consensus mechanisms and high-throughput liquidity to enable automated algorithmic strategies.
                     </p>
                     <p>
                       The current quantitative models indicate persistent structural accumulation, allowing executing engines to harness fractional volume discrepancies optimally.

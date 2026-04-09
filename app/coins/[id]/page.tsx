@@ -11,7 +11,7 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { binanceWS, getHistoricalKlines, type BinanceKline } from '@/lib/binance-websocket'
+import { binanceWS, getHistoricalKlines, getCoingeckoHistoryFull, type BinanceKline, type PrecomputedMAs } from '@/lib/binance-websocket'
 
 interface CoinDetailPageProps {
   params: Promise<{ id: string }>
@@ -56,6 +56,7 @@ export default function CoinDetailPage({ params }: CoinDetailPageProps) {
   const [chartLoading, setChartLoading] = useState(true)
   const [wsConnected, setWsConnected] = useState(false)
   const [currentPrice, setCurrentPrice] = useState<number | null>(null)
+  const [precomputedMAs, setPrecomputedMAs] = useState<PrecomputedMAs | undefined>(undefined)
 
   const { coin, loading: coinLoading } = useCoinDetail(resolvedParams?.id || '')
 
@@ -76,44 +77,53 @@ export default function CoinDetailPage({ params }: CoinDetailPageProps) {
     const initializeChart = async () => {
       if (isMounted) setChartLoading(true)
       try {
-        // Fetch historical data - Request 1000 candles for max history
-        // 1000 candles * 1d = ~3 years. 1w = ~19 years.
-        const limit = 1000
-        const historicalData = await getHistoricalKlines(binanceSymbol, selectedTimeframe, limit)
-
-        if (isMounted) {
-          if (historicalData.length > 0) {
-            setCandlestickData(historicalData)
-            setCurrentPrice(historicalData[historicalData.length - 1].close)
-          } else {
-            // If implicit mapping fails, maybe try without USDT if it's a stablecoin? 
-            // But for now, empty state is better than crash.
+        if (selectedTimeframe === 'max') {
+          const { klines, mas } = await getCoingeckoHistoryFull(resolvedParams.id, 'max')
+          if (isMounted) {
+            setCandlestickData(klines)
+            setPrecomputedMAs(mas)
+            setWsConnected(false)
+            if (klines.length > 0) {
+              setCurrentPrice(klines[klines.length - 1].close)
+            }
           }
+        } else {
+          // Fetch historical data from Binance
+          const limit = 1000
+          const historicalData = await getHistoricalKlines(binanceSymbol, selectedTimeframe, limit)
+
+          if (isMounted) {
+            setPrecomputedMAs(undefined)
+            if (historicalData.length > 0) {
+              setCandlestickData(historicalData)
+              setCurrentPrice(historicalData[historicalData.length - 1].close)
+            }
+          }
+
+          // Subscribe to real-time updates
+          unsubscribe = binanceWS.subscribeKline(
+            binanceSymbol,
+            selectedTimeframe,
+            (kline) => {
+              if (!isMounted) return
+              setWsConnected(true)
+              setCurrentPrice(kline.close)
+
+              setCandlestickData((prev) => {
+                const newData = [...prev]
+                const lastCandle = newData[newData.length - 1]
+
+                if (lastCandle && lastCandle.time === kline.time) {
+                  newData[newData.length - 1] = kline
+                } else if (kline.isClosed || !lastCandle || kline.time > lastCandle.time) {
+                  newData.push(kline)
+                  if (newData.length > 2000) newData.shift()
+                }
+                return newData
+              })
+            }
+          )
         }
-
-        // Subscribe to real-time updates
-        unsubscribe = binanceWS.subscribeKline(
-          binanceSymbol,
-          selectedTimeframe,
-          (kline) => {
-            if (!isMounted) return
-            setWsConnected(true)
-            setCurrentPrice(kline.close)
-
-            setCandlestickData((prev) => {
-              const newData = [...prev]
-              const lastCandle = newData[newData.length - 1]
-
-              if (lastCandle && lastCandle.time === kline.time) {
-                newData[newData.length - 1] = kline
-              } else if (kline.isClosed || !lastCandle || kline.time > lastCandle.time) {
-                newData.push(kline)
-                if (newData.length > 2000) newData.shift() // Keep chart performant
-              }
-              return newData
-            })
-          }
-        )
       } catch (e) {
         console.error("Chart init error:", e)
       } finally {
@@ -236,6 +246,7 @@ export default function CoinDetailPage({ params }: CoinDetailPageProps) {
                   <ToggleGroupItem value="4h" size="sm">4H</ToggleGroupItem>
                   <ToggleGroupItem value="1d" size="sm">1D</ToggleGroupItem>
                   <ToggleGroupItem value="1w" size="sm">1W</ToggleGroupItem>
+                  <ToggleGroupItem value="max" size="sm">MAX</ToggleGroupItem>
                 </ToggleGroup>
               </div>
             </CardHeader>
@@ -247,7 +258,7 @@ export default function CoinDetailPage({ params }: CoinDetailPageProps) {
               ) : (
                 <div className="h-[500px] w-full rounded-lg overflow-hidden border border-border/50 bg-card">
                   {candlestickData.length > 0 ? (
-                    <FinancialChart data={candlestickData} />
+                    <FinancialChart data={candlestickData} precomputedMAs={precomputedMAs} />
                   ) : (
                     <div className="flex h-full items-center justify-center text-muted-foreground">
                       Chart data not available for this pair on Binance.

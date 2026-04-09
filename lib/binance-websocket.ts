@@ -1,6 +1,8 @@
 // Binance WebSocket service for real-time price data
 // Free to use - no API key required for public market data
 
+import type { Time } from 'lightweight-charts'
+
 const BINANCE_WS_BASE = 'wss://stream.binance.com:9443/ws'
 
 export interface BinanceKline {
@@ -19,6 +21,12 @@ export interface BinanceTicker {
     priceChange: number
     priceChangePercent: number
     volume: number
+}
+
+export interface PrecomputedMAs {
+    ma7: { time: Time; value: number }[]
+    ma25: { time: Time; value: number }[]
+    ma99: { time: Time; value: number }[]
 }
 
 type KlineCallback = (kline: BinanceKline) => void
@@ -296,6 +304,109 @@ export async function getHistoricalKlines(
             lastClose = close;
         }
         return mockKlines;
+    }
+}
+
+// Fetch full history (all available) from CoinGecko API route and convert to OHLC-like candles
+export async function getCoingeckoHistoryFull(
+    coinId: string,
+    days: string = 'max'
+): Promise<{ klines: BinanceKline[]; mas: PrecomputedMAs }> {
+    let points: Array<{ timestamp: string | number; price: number }> = []
+
+    // 1) Try app API route first
+    try {
+        const response = await fetch(`/api/coins/${coinId}/history?days=${days}`)
+        if (response.ok) {
+            const json = await response.json()
+            points = (json?.data || []) as Array<{ timestamp: string | number; price: number }>
+        }
+    } catch {
+        // continue to fallback
+    }
+
+    // 2) Fallback direct CoinGecko public endpoint (no key path)
+    if (!points.length) {
+        const fallback = await fetch(
+            `https://api.coingecko.com/api/v3/coins/${coinId}/market_chart?vs_currency=usd&days=${days}`
+        )
+        if (fallback.ok) {
+            const data = await fallback.json()
+            points = ((data?.prices || []) as [number, number][]).map((p) => ({
+                timestamp: p[0],
+                price: p[1],
+            }))
+        }
+    }
+
+    // 3) Final resilience fallback to Binance history if CoinGecko blocks (401/429/etc)
+    if (!points.length) {
+        const symbolMap: Record<string, string> = {
+            bitcoin: 'BTCUSDT',
+            ethereum: 'ETHUSDT',
+            binancecoin: 'BNBUSDT',
+            cardano: 'ADAUSDT',
+            solana: 'SOLUSDT',
+            ripple: 'XRPUSDT',
+            dogecoin: 'DOGEUSDT',
+            'matic-network': 'MATICUSDT',
+            polkadot: 'DOTUSDT',
+            litecoin: 'LTCUSDT',
+            'avalanche-2': 'AVAXUSDT',
+            chainlink: 'LINKUSDT',
+            uniswap: 'UNIUSDT',
+            cosmos: 'ATOMUSDT',
+            'ethereum-classic': 'ETCUSDT',
+        }
+        const symbol = symbolMap[coinId] || 'BTCUSDT'
+        const binanceKlines = await getHistoricalKlines(symbol, '1d', 1000)
+        points = binanceKlines.map((k) => ({
+            timestamp: k.time,
+            price: k.close,
+        }))
+    }
+
+    const klines: BinanceKline[] = points.map((p, idx) => {
+        const time = typeof p.timestamp === 'number' ? p.timestamp : new Date(p.timestamp).getTime()
+        const price = Number(p.price) || 0
+        const prev = idx > 0 ? Number(points[idx - 1].price) || price : price
+        const drift = Math.abs(price - prev)
+        const high = Math.max(price, prev) + drift * 0.15
+        const low = Math.max(0, Math.min(price, prev) - drift * 0.15)
+        return {
+            time,
+            open: prev || price,
+            high: high || price,
+            low: low || price,
+            close: price,
+            volume: Math.max(1, drift * 1000), // synthetic volume
+            isClosed: true,
+        }
+    })
+
+    const buildMA = (input: BinanceKline[], period: number) => {
+        const out: { time: Time; value: number }[] = []
+        let sum = 0
+        for (let i = 0; i < input.length; i++) {
+            sum += input[i].close
+            if (i >= period) sum -= input[i - period].close
+            if (i >= period - 1) {
+                out.push({
+                    time: (input[i].time / 1000) as Time,
+                    value: sum / period,
+                })
+            }
+        }
+        return out
+    }
+
+    return {
+        klines,
+        mas: {
+            ma7: buildMA(klines, 7),
+            ma25: buildMA(klines, 25),
+            ma99: buildMA(klines, 99),
+        },
     }
 }
 

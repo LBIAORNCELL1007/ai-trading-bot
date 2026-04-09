@@ -4,6 +4,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { BarChart3, Settings } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { GlobalTradeConfig } from '@/components/global-trade-config'
 
 export function AppHeader() {
   const pathname = usePathname()
@@ -27,6 +28,8 @@ export function AppHeader() {
 
         {/* Navigation */}
         <nav className="flex items-center gap-2">
+          <GlobalTradeConfig />
+          
           <Button
             variant="ghost"
             asChild

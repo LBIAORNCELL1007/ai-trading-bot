@@ -28,7 +28,8 @@ export function PriceChartCrypto({ data, symbol, loading }: PriceChartCryptoProp
   const [selectedRange, setSelectedRange] = useState<TimeRange>('max')
   const [chartType, setChartType] = useState<'line' | 'area'>('area')
 
-  const filteredData = data.slice(-500).map((point) => ({
+  // Show all data without slicing to ensure full historical view is available
+  const filteredData = data.map((point) => ({
     timestamp: new Date(point.timestamp).getTime(),
     time: new Date(point.timestamp).toLocaleDateString('en-US', {
       month: 'short',
