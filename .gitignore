@@ -1,27 +1,44 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
-
-# dependencies
-/node_modules
-
-# next.js
-/.next/
-/out/
-
-# production
-/build
-
-# debug
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
-
-# env files
-.env*
-
-# vercel
+# --- Node / Next.js ---
+node_modules/
+.next/
+out/
+build/
 .vercel
-
-# typescript
 *.tsbuildinfo
-next-env.d.ts
+
+# --- Python / Environment ---
+__pycache__/
+venv/
+env/
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+*.pyc
+*.pyo
+*.pyd
+
+# --- Machine Learning & Big Data ---
+*.csv
+*.json
+!institutional_xgboost_model.json
+!global_tbm_xgboost_model.json
+!package.json
+!tsconfig.json
+!components.json
+!next.config.mjs
+!postcss.config.mjs
+!tailwind.config.js
+*.pkl
+*.pth
+*.h5
+
+# --- OS & IDE Junk ---
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.log
+ts_errors.txt

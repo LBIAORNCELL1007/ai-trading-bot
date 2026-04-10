@@ -5,186 +5,197 @@ import xgboost as xgb
 import pandas as pd
 import numpy as np
 import requests
+import time
 
-app = FastAPI(title="AI Trading Bot Model API")
+"""
+Institutional FastAPI Backend: Universal Blindness Model
+This microservice fetches live Binance Futures data, performs dynamic 
+Rolling Z-Score normalization, and executes a sniper-threshold prediction.
+"""
 
-# Configure CORS to allow requests from the Next.js frontend
+app = FastAPI(title="AI Trading Bot Institutional API")
+
+# Configure CORS for Next.js
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"], # Allow all for debugging connection issues
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load the XGBClassifier model globally when the application starts
+# 1. Setup & Model Loading
 model = xgb.XGBClassifier()
+MODEL_PATH = "institutional_xgboost_model.json"
+
 try:
-    model.load_model("tbm_xgboost_model_v2.json")
-    print("Successfully loaded tbm_xgboost_model_v2.json")
+    model.load_model(MODEL_PATH)
+    print(f"[SUCCESS] Loaded institutional model: {MODEL_PATH}")
 except Exception as e:
-    print(f"Error loading model: {e}")
-    print("Please ensure 'tbm_xgboost_model_v2.json' is in the same directory as this script.")
+    print(f"[ERROR] Failed to load model: {e}")
+    # Fallback to older model if institutional is missing
+    try:
+        model.load_model("global_tbm_xgboost_model.json")
+        print("[FALLBACK] Loaded global_tbm_xgboost_model.json")
+    except:
+        pass
 
 class PredictRequest(BaseModel):
     symbol: str
 
 def get_weights_ffd(d, thres=1e-4):
-    """
-    Computes the weights for the Fixed-Width Window Fractional Differencing (FFD) method.
-    """
     w, k = [1.], 1
     while True:
         w_ = -w[-1] / k * (d - k + 1)
-        if abs(w_) < thres:
-            break
+        if abs(w_) < thres: break
         w.append(w_)
         k += 1
-    return np.array(w[::-1]).reshape(-1, 1)
+    return np.array(w[::-1])
 
-def frac_diff_ffd(series, d, thres=1e-4):
+def apply_frac_diff_live(series, d, thres=1e-4):
     """
-    Applies Fixed-Width Window Fractional Differencing.
+    Applies Fractional Differencing to a live series.
+    Uses convolution for efficiency and returns the last (current) value.
     """
     w = get_weights_ffd(d, thres)
-    width = len(w) - 1
+    width = len(w)
+    if len(series) < width:
+        # If not enough data, use truncated weights for a rough estimate
+        # or return NaN. To ensure production stability, we fetch more rows in fetcher.
+        return np.nan
     
-    df = {}
-    for name in series.columns:
-        series_f = series[[name]].ffill().dropna()
-        df_ = pd.Series(dtype=float, index=series_f.index)
-        
-        for iloc1 in range(width, series_f.shape[0]):
-            loc0 = series_f.index[iloc1 - width]
-            loc1 = series_f.index[iloc1]
-            
-            if not np.isfinite(series.loc[loc1, name]):
-                continue
-                
-            df_[loc1] = np.dot(w.T, series_f.loc[loc0:loc1, name])[0]
-            
-        df[name] = df_.copy(deep=True)
-        
-    return pd.concat(df, axis=1)
+    vals = series.values
+    output = np.convolve(vals, w, mode='valid')
+    return float(output[-1])
 
-def fetch_binance_futures_data(symbol, interval="1h", limit=300):
+# 2. The Live Fetch
+def fetch_binance_data(symbol):
     """
-    Fetches the last N hours of OHLCV, Open Interest, and Funding Rate data from Binance Futures.
-    Note: limit is set to 300 (instead of 100) to ensure the fracdiff function has enough lookback 
-    history (~282 periods) to generate a valid current value without returning NaN.
+    Fetches 500 hours of data with timestamp-based joining to ensure
+    all features (OHLCV, OI, Funding) are perfectly aligned and non-NaN.
     """
-    # 1. Fetch OHLCV (Klines)
-    ohlcv_url = "https://fapi.binance.com/fapi/v1/klines"
-    res = requests.get(ohlcv_url, params={"symbol": symbol, "interval": interval, "limit": limit})
-    res.raise_for_status()
-    
-    df_ohlcv = pd.DataFrame(res.json(), columns=[
-        'timestamp', 'open', 'high', 'low', 'close', 'volume', 
-        'close_time', 'quote_asset_volume', 'number_of_trades', 
-        'taker_buy_base', 'taker_buy_quote', 'ignore'
-    ])
-    df_ohlcv['timestamp'] = pd.to_datetime(df_ohlcv['timestamp'], unit='ms')
-    df_ohlcv.set_index('timestamp', inplace=True)
-    for col in ['open', 'high', 'low', 'close', 'volume']:
-        df_ohlcv[col] = df_ohlcv[col].astype(float)
-        
-    # 2. Fetch Open Interest (OI)
-    oi_url = "https://fapi.binance.com/futures/data/openInterestHist"
-    res = requests.get(oi_url, params={"symbol": symbol, "period": interval, "limit": limit})
-    res.raise_for_status()
-    
-    df_oi = pd.DataFrame(res.json())
-    df_oi['timestamp'] = pd.to_datetime(df_oi['timestamp'], unit='ms')
-    df_oi.set_index('timestamp', inplace=True)
-    df_oi['open_interest'] = df_oi['sumOpenInterest'].astype(float)
-    
-    # 3. Fetch Funding Rate History
-    fr_url = "https://fapi.binance.com/fapi/v1/fundingRate"
-    res = requests.get(fr_url, params={"symbol": symbol, "limit": limit})
-    res.raise_for_status()
-    
-    df_fr = pd.DataFrame(res.json())
-    df_fr['timestamp'] = pd.to_datetime(df_fr['fundingTime'], unit='ms')
-    df_fr.set_index('timestamp', inplace=True)
-    df_fr['funding_rate'] = df_fr['fundingRate'].astype(float)
-    
-    # 4. Merge DataFrames on Timestamp
-    df = df_ohlcv[['open', 'high', 'low', 'close', 'volume']].join(df_oi[['open_interest']], how='left')
-    df = df.join(df_fr[['funding_rate']], how='left')
-    
-    # Forward-fill and back-fill missing funding rates and open interest
-    df['funding_rate'] = df['funding_rate'].ffill().bfill().infer_objects(copy=False)
-    df['open_interest'] = df['open_interest'].ffill().bfill().infer_objects(copy=False)
-    
-    return df
+    try:
+        limit = 500
+        # 1. OHLCV
+        ohlcv_url = "https://fapi.binance.com/fapi/v1/klines"
+        res_ohlcv = requests.get(ohlcv_url, params={"symbol": symbol, "interval": "1h", "limit": limit})
+        res_ohlcv.raise_for_status()
+        df = pd.DataFrame(res_ohlcv.json(), columns=['ts', 'open', 'high', 'low', 'close', 'volume', 'ct', 'qv', 'nt', 'tb', 'tq', 'i'])
+        df['timestamp'] = pd.to_datetime(df['ts'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        df = df[['open', 'high', 'low', 'close', 'volume']].astype(float)
 
-def engineer_live_features(df):
-    """
-    Engineers the exact features required by the XGBoost model.
-    """
-    # Percentage changes
-    df['oi_change_1h'] = df['open_interest'].pct_change(fill_method=None)
-    df['volume_change_1h'] = df['volume'].pct_change(fill_method=None)
-    
-    # Order Flow Toxicity Proxies
-    df['buying_rejection'] = df['high'] - df['close']
-    df['selling_rejection'] = df['close'] - df['low']
-    
-    # Fractional Differencing (d=0.4)
-    fd_df = frac_diff_ffd(df[['close']], d=0.4, thres=1e-4)
-    df['close_fd_04'] = fd_df['close']
-    
-    return df
+        # 2. Open Interest
+        oi_url = "https://fapi.binance.com/futures/data/openInterestHist"
+        res_oi = requests.get(oi_url, params={"symbol": symbol, "period": "1h", "limit": limit})
+        res_oi.raise_for_status()
+        df_oi = pd.DataFrame(res_oi.json())
+        if not df_oi.empty:
+            df_oi['timestamp'] = pd.to_datetime(df_oi['timestamp'], unit='ms')
+            df_oi.set_index('timestamp', inplace=True)
+            df_oi['open_interest'] = df_oi['sumOpenInterest'].astype(float)
+            df = df.join(df_oi[['open_interest']], how='left')
+
+        # 3. Funding Rate
+        fr_url = "https://fapi.binance.com/fapi/v1/fundingRate"
+        res_fr = requests.get(fr_url, params={"symbol": symbol, "limit": limit})
+        res_fr.raise_for_status()
+        df_fr = pd.DataFrame(res_fr.json())
+        if not df_fr.empty:
+            df_fr['timestamp'] = pd.to_datetime(df_fr['fundingTime'], unit='ms')
+            df_fr.set_index('timestamp', inplace=True)
+            df_fr['funding_rate'] = df_fr['fundingRate'].astype(float)
+            df = df.join(df_fr[['funding_rate']], how='left')
+
+        # Final Clean: Forward fill gaps (like 8h funding) and zero-fill remaining
+        df['open_interest'] = df['open_interest'].ffill().fillna(0)
+        df['funding_rate'] = df['funding_rate'].ffill().fillna(0)
+
+        return df
+    except Exception as e:
+        print(f"Data Fetch Error: {e}")
+        return None
 
 @app.post("/api/predict")
 async def predict(request: PredictRequest):
-    try:
-        # 1. Fetch live data
-        print(f"\n--- [LIVE FETCH] Initiating request to Binance for {request.symbol} ---")
-        # We fetch 300 hours to ensure fracdiff has enough lookback data to calculate the final row.
-        df = fetch_binance_futures_data(symbol=request.symbol, interval="1h", limit=300)
-        
-        # 2. Engineer features in real-time
-        df = engineer_live_features(df)
-        
-        # 3. Drop rows with NaNs (specifically caused by fracdiff and pct_change lookback)
-        df = df.dropna()
-        
-        if df.empty:
-            raise HTTPException(status_code=500, detail="Not enough data after feature engineering to make a prediction.")
-            
-        print(f"[LIVE DATA] Current Market State:\n{df[['close', 'volume', 'open_interest', 'funding_rate']].tail(1)}\n")
+    symbol = request.symbol.upper()
+    print(f"\n--- Live Prediction Request: {symbol} ---")
 
-        # 4. Isolate the very last row (the current, live hour)
-        live_row = df.iloc[[-1]]
+    # Fetch data
+    df = fetch_binance_data(symbol)
+    if df is None or df.empty:
+        raise HTTPException(status_code=500, detail="Failed to fetch data from Binance.")
+
+    try:
+        # 3. Dynamic Rolling Normalization & Feature Engineering
+        # Calculate changes/rejections BEFORE normalization
+        df['oi_change_1h'] = df['open_interest'].pct_change()
+        df['volume_change_1h'] = df['volume'].pct_change()
+        df['buying_rejection'] = df['high'] - df['close']
+        df['selling_rejection'] = df['close'] - df['low']
         
-        # Ensure exact column match with training data
-        feature_columns = [
+        # Stationary Close (FracDiff d=0.4)
+        w = get_weights_ffd(d=0.4, thres=1e-4)
+        width = len(w)
+        vals = df['close'].values
+        
+        # Safety Check: Ensure data is longer than the weights window
+        if len(vals) >= width:
+            fd_values = np.convolve(vals, w, mode='valid')
+            full_fd_series = np.full(len(df), np.nan)
+            full_fd_series[width-1:] = fd_values
+            df['close_fd_04'] = full_fd_series
+        else:
+            print(f"Warning: Data length ({len(vals)}) is less than FracDiff window ({width})")
+            df['close_fd_04'] = 0.0 # Fallback
+
+        # 3. Dynamic Rolling Normalization (CRITICAL)
+        # Use only the last 30 hours for Z-Score statistics as requested
+        window_30_stats = df.iloc[-30:].copy()
+        
+        for col in ['volume', 'open_interest', 'funding_rate']:
+            mean = window_30_stats[col].mean()
+            std = window_30_stats[col].std()
+            # Normalize the current (last) row using the 30-period rolling stats
+            df.at[df.index[-1], col] = (df.iloc[-1][col] - mean) / (std if std != 0 else 1)
+
+        # 4. Model Execution
+        # Isolate the final formatted row
+        feature_cols = [
             'volume', 'open_interest', 'funding_rate', 'oi_change_1h', 
             'volume_change_1h', 'buying_rejection', 'selling_rejection', 'close_fd_04'
         ]
         
-        live_features = live_row[feature_columns]
+        live_row = df[feature_cols].iloc[-1:].copy()
         
-        # 5. Generate prediction
-        prediction = model.predict(live_features)
-        probability = model.predict_proba(live_features)
-        
-        # Cast to native Python types
-        final_action = int(prediction[0])
-        final_confidence = float(probability[0][1])
+        # Verify no NaNs in the prediction row
+        if live_row.isnull().values.any():
+            print(f"Warning: NaNs detected in live row: \n{live_row}")
+            live_row.fillna(0, inplace=True)
 
-        print(f"[AI PREDICTION] Action: {final_action}, Confidence: {final_confidence}\n----------------------------------------------------")
-        
+        print(f"Live Normalized Row:\n{live_row.to_dict('records')[0]}")
+
+        # Predict Probabilities
+        probs = model.predict_proba(live_row)
+        raw_confidence = float(probs[0][1])
+
+        # 5. The Sniper Threshold (0.65)
+        final_action = 1 if raw_confidence >= 0.65 else 0
+
+        print(f"Raw Confidence (Win): {raw_confidence:.4f}")
+        print(f"Final Action Decision: {final_action}")
+
+        # 6. Return payload
         return {
-            "symbol": request.symbol,
+            "symbol": symbol,
             "action": final_action,
-            "confidence": final_confidence
+            "confidence": raw_confidence
         }
-        
-    except requests.exceptions.RequestException as e:
-        print(f"Binance API Error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to fetch live data from Binance Futures API.")
+
     except Exception as e:
-        print(f"Internal Server Error: {e}")
+        print(f"Prediction Pipeline Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

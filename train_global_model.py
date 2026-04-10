@@ -2,6 +2,8 @@ import pandas as pd
 import numpy as np
 import xgboost as xgb
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.preprocessing import StandardScaler
+import joblib
 import warnings
 
 # Suppress XGBoost warnings for cleaner output
@@ -50,15 +52,54 @@ def time_series_split(X, y, train_ratio=0.70, val_ratio=0.15):
     train_end = int(n_samples * train_ratio)
     val_end = int(n_samples * (train_ratio + val_ratio))
     
-    X_train, y_train = X.iloc[:train_end], y.iloc[:train_end]
-    X_val, y_val = X.iloc[train_end:val_end], y.iloc[train_end:val_end]
-    X_test, y_test = X.iloc[val_end:], y.iloc[val_end:]
+    X_train, y_train = X.iloc[:train_end].copy(), y.iloc[:train_end].copy()
+    X_val, y_val = X.iloc[train_end:val_end].copy(), y.iloc[train_end:val_end].copy()
+    X_test, y_test = X.iloc[val_end:].copy(), y.iloc[val_end:].copy()
     
     print(f"Train Set: {len(X_train)} rows")
     print(f"Validation Set: {len(X_val)} rows")
     print(f"Test Set: {len(X_test)} rows")
     
     return X_train, y_train, X_val, y_val, X_test, y_test
+
+def normalize_features(X_train, X_val, X_test):
+    """
+    Normalizes specific columns that have vastly different scales across assets.
+    The scaler is fitted ONLY on the training set to prevent data leakage.
+    """
+    print("\nNormalizing absolute scale features to prevent dominance by large-cap assets...")
+    
+    # Initialize the scaler
+    scaler = StandardScaler()
+    
+    # Define columns to scale
+    cols_to_scale = ['volume', 'open_interest', 'funding_rate']
+    
+    # Verify columns exist before scaling
+    missing_cols = [col for col in cols_to_scale if col not in X_train.columns]
+    if missing_cols:
+        print(f"Warning: The following columns to scale are missing: {missing_cols}")
+        cols_to_scale = [col for col in cols_to_scale if col in X_train.columns]
+    
+    if cols_to_scale:
+        print(f"Scaling columns: {cols_to_scale}")
+        
+        # Fit ONLY on the training set
+        scaler.fit(X_train[cols_to_scale])
+        
+        # Transform Train, Validation, and Test sets
+        X_train.loc[:, cols_to_scale] = scaler.transform(X_train[cols_to_scale])
+        X_val.loc[:, cols_to_scale] = scaler.transform(X_val[cols_to_scale])
+        X_test.loc[:, cols_to_scale] = scaler.transform(X_test[cols_to_scale])
+        
+        # Save the scaler for deployment
+        scaler_file = 'global_scaler.pkl'
+        joblib.dump(scaler, scaler_file)
+        print(f"Saved fitted StandardScaler to {scaler_file}")
+    else:
+        print("No absolute columns found to scale.")
+        
+    return X_train, X_val, X_test
 
 def calculate_imbalance_ratio(y_train):
     """
@@ -137,10 +178,13 @@ def main():
     # 2. Chronological Split
     X_train, y_train, X_val, y_val, X_test, y_test = time_series_split(X, y)
     
-    # 3. Handle Imbalance
+    # 3. Normalize specific features to prevent large-cap dominance
+    X_train, X_val, X_test = normalize_features(X_train, X_val, X_test)
+    
+    # 4. Handle Imbalance
     imbalance_ratio = calculate_imbalance_ratio(y_train)
     
-    # 4. Train & Evaluate
+    # 5. Train & Evaluate
     model = train_and_evaluate_model(
         X_train, y_train, 
         X_val, y_val, 
@@ -148,11 +192,11 @@ def main():
         scale_pos_weight=imbalance_ratio
     )
     
-    # 5. Save the Universal Model
+    # 6. Save the Universal Model
     output_model_file = 'global_tbm_xgboost_model.json'
     print(f"\nSaving the trained Universal Multi-Asset Model to {output_model_file}...")
     model.save_model(output_model_file)
-    print("Success! You can now deploy this model to your FastAPI microservice.")
+    print("Success! You can now deploy this model and global_scaler.pkl to your FastAPI microservice.")
 
 if __name__ == "__main__":
     main()
