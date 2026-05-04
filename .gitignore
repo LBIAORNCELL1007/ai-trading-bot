@@ -33,6 +33,14 @@ env/
 *.pkl
 *.pth
 *.h5
+*.parquet
+
+# Live-bot state and runtime artifacts
+*.db
+*.sqlite
+*.sqlite3
+live_bot.log
+baseline_backup_*/
 
 # --- OS & IDE Junk ---
 .DS_Store

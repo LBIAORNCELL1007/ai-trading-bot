@@ -2,7 +2,14 @@ import pandas as pd
 import numpy as np
 
 
-def apply_triple_barrier(df, tp_pct=0.015, sl_pct=-0.015, time_limit=24):
+def apply_triple_barrier(
+    df,
+    tp_pct=0.015,
+    sl_pct=-0.015,
+    time_limit=24,
+    vol_series=None,
+    vol_multiplier=0.2,
+):
     """
     Triple Barrier Method (López de Prado §3) — labels each bar by which of
     three barriers is hit first within `time_limit` bars:
@@ -15,11 +22,24 @@ def apply_triple_barrier(df, tp_pct=0.015, sl_pct=-0.015, time_limit=24):
     df : DataFrame
         Must contain 'close', 'high', 'low' columns (intra-bar resolution).
     tp_pct : float
-        Take-profit barrier as a fraction (e.g. 0.015 = 1.5% above entry).
+        Fixed take-profit barrier (used when vol_series is None, OR as the
+        fallback when vol[i] is NaN/0).
     sl_pct : float
-        Stop-loss barrier as a NEGATIVE fraction (e.g. -0.015 = 1.5% below).
+        Fixed stop-loss barrier (NEGATIVE).
     time_limit : int
         Maximum number of forward bars to evaluate.
+    vol_series : pd.Series or None
+        Per-bar sigma estimate aligned to df.index (e.g. realized_vol_24h =
+        rolling std of log-returns).  When provided, per-row barriers become:
+            target_i = vol_multiplier * vol[i] * sqrt(time_limit)
+            tp = +target_i,  sl = -target_i
+        This makes barriers regime-adaptive: tighter in calm markets,
+        wider in volatile ones.  López de Prado §3.4 ("Dynamic Thresholds").
+    vol_multiplier : float
+        Scale factor applied to the sigma-over-horizon estimate.  0.2 yields
+        roughly 1% mean barriers for crypto-1h data (matches fixed 1% baseline
+        in expectation).  Larger = wider barriers = lower fire-rate but
+        cleaner labels.
 
     Returns
     -------
@@ -45,7 +65,8 @@ def apply_triple_barrier(df, tp_pct=0.015, sl_pct=-0.015, time_limit=24):
     """
     print(
         f"Applying Triple Barrier Method (TP: {tp_pct * 100:+.2f}%, "
-        f"SL: {sl_pct * 100:+.2f}%, Time Limit: {time_limit} periods)..."
+        f"SL: {sl_pct * 100:+.2f}%, Time Limit: {time_limit} periods, "
+        f"vol_scaled={'YES (mult={:.3f})'.format(vol_multiplier) if vol_series is not None else 'NO'})..."
     )
 
     n = len(df)
@@ -53,13 +74,40 @@ def apply_triple_barrier(df, tp_pct=0.015, sl_pct=-0.015, time_limit=24):
     highs = df["high"].values if "high" in df.columns else closes
     lows = df["low"].values if "low" in df.columns else closes
 
+    # Per-row barrier targets.  When vol_series is supplied, tp[i] = +target_i
+    # and sl[i] = -target_i where target_i = mult * vol[i] * sqrt(horizon).
+    # NaN/<=0 vol falls back to the fixed tp_pct/|sl_pct| pair.
+    horizon_sqrt = np.sqrt(float(time_limit))
+    if vol_series is not None:
+        vol_arr = vol_series.reindex(df.index).values.astype(float)
+        dyn_target = vol_multiplier * vol_arr * horizon_sqrt
+        bad = ~np.isfinite(dyn_target) | (dyn_target <= 0.0)
+        # Fallback: use the absolute value of fixed tp_pct (assumes symmetric)
+        fallback = max(tp_pct, abs(sl_pct))
+        dyn_target = np.where(bad, fallback, dyn_target)
+        tp_arr = dyn_target
+        sl_arr = -dyn_target
+        # Diagnostic so we can sanity-check the barrier distribution
+        finite = dyn_target[np.isfinite(dyn_target)]
+        if len(finite):
+            print(
+                f"  Vol-scaled barriers: mean={finite.mean() * 100:.3f}%  "
+                f"median={np.median(finite) * 100:.3f}%  "
+                f"p10={np.percentile(finite, 10) * 100:.3f}%  "
+                f"p90={np.percentile(finite, 90) * 100:.3f}%  "
+                f"fallback_rows={int(bad.sum())}"
+            )
+    else:
+        tp_arr = np.full(n, tp_pct, dtype=float)
+        sl_arr = np.full(n, sl_pct, dtype=float)
+
     labels = np.full(n, np.nan)
     hit_times = np.full(n, np.nan)
 
     for i in range(n - time_limit):
         entry = closes[i]
-        upper = entry * (1 + tp_pct)
-        lower = entry * (1 + sl_pct)  # sl_pct is negative
+        upper = entry * (1 + tp_arr[i])
+        lower = entry * (1 + sl_arr[i])  # sl is negative
 
         hit_label = 0  # default: time-expiry → loss
         hit_time = time_limit

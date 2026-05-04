@@ -272,6 +272,8 @@ def process_symbol(
     sl_pct=-0.010,
     time_limit=24,
     interval="1h",
+    vol_scaled_barriers=False,
+    vol_multiplier=0.2,
 ):
     print(f"\n--- Processing {symbol} ({days}d, interval={interval}) ---")
 
@@ -400,7 +402,19 @@ def process_symbol(
     #    Concern #5 fix: tightened to symmetric +/-1% (was +/-1.5%) so the
     #    horizon is shorter -> higher fire-rate -> more *unique* samples per
     #    unit time.  Effective N rises noticeably.
-    df = apply_triple_barrier(df, tp_pct=tp_pct, sl_pct=sl_pct, time_limit=time_limit)
+    #
+    #    Experiment A: when vol_scaled_barriers=True, barriers become
+    #    per-row dynamic, scaled by realized_vol_24h * sqrt(time_limit) *
+    #    vol_multiplier (regime-adaptive labelling, López §3.4).
+    vol_for_labeling = df["realized_vol_24h"] if vol_scaled_barriers else None
+    df = apply_triple_barrier(
+        df,
+        tp_pct=tp_pct,
+        sl_pct=sl_pct,
+        time_limit=time_limit,
+        vol_series=vol_for_labeling,
+        vol_multiplier=vol_multiplier,
+    )
 
     # 4. Apply Fractional Differencing to create a stationary close
     print("  Applying fractional differencing to 'close'...")
@@ -500,6 +514,21 @@ def main():
         default=None,
         help="TBM time limit in bars (default: 24 for 1h, 6 for 4h = 24h hold).",
     )
+    parser.add_argument(
+        "--vol-scaled-barriers",
+        action="store_true",
+        help="Experiment A: scale TBM barriers per-row by realized_vol_24h * "
+        "sqrt(time_limit) * vol_multiplier (regime-adaptive labelling). "
+        "Falls back to fixed --tp-pct/--sl-pct when vol is NaN.",
+    )
+    parser.add_argument(
+        "--vol-multiplier",
+        type=float,
+        default=0.2,
+        help="Scale for vol-scaled barriers. 0.2 ~ 1%% mean barrier on "
+        "1h crypto data over 24h horizon (matches fixed-1%% baseline in "
+        "expectation). Only used with --vol-scaled-barriers.",
+    )
     args = parser.parse_args()
 
     # Sensible per-interval defaults for TBM if user didn't override.
@@ -514,6 +543,7 @@ def main():
     print(
         f"Universe: {universe}  |  days={args.days}  |  interval={args.interval}  |  "
         f"TBM=+{args.tp_pct:.4f}/{args.sl_pct:.4f}/{args.time_limit}bars  |  "
+        f"vol_scaled={args.vol_scaled_barriers} (mult={args.vol_multiplier})  |  "
         f"output={args.output}"
     )
     all_dfs = []
@@ -526,6 +556,8 @@ def main():
             sl_pct=args.sl_pct,
             time_limit=args.time_limit,
             interval=args.interval,
+            vol_scaled_barriers=args.vol_scaled_barriers,
+            vol_multiplier=args.vol_multiplier,
         )
         if df_sym is not None and not df_sym.empty:
             all_dfs.append(df_sym)

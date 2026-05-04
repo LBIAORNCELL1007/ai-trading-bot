@@ -13,6 +13,7 @@ Reports:
 
 from __future__ import annotations
 
+import argparse
 import sys
 
 import numpy as np
@@ -33,10 +34,20 @@ def epnl(wr: float) -> float:
 
 
 def main() -> int:
-    print(f"Loading {DATA} ...")
-    df = pd.read_csv(DATA)
-    print(f"Loading {OOF} ...")
-    oof = pd.read_csv(OOF)
+    ap = argparse.ArgumentParser()
+    ap.add_argument(
+        "--data", default=DATA, help="Dataset CSV (must align row-for-row with --oof)."
+    )
+    ap.add_argument(
+        "--oof", default=OOF, help="OOF predictions CSV from train_tbm_model_v2.py."
+    )
+    args = ap.parse_args()
+    data_path = args.data
+    oof_path = args.oof
+    print(f"Loading {data_path} ...")
+    df = pd.read_csv(data_path)
+    print(f"Loading {oof_path} ...")
+    oof = pd.read_csv(oof_path)
     if len(df) != len(oof):
         print(f"[FATAL] dataset len {len(df)} != oof len {len(oof)}")
         return 1
