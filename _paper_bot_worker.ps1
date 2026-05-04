@@ -6,7 +6,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 Set-Location 'D:\ai-trading-bot'
 
 $Python  = 'C:\Python314\python.exe'
-$Symbols = 'SOLUSDT,DOGEUSDT,XRPUSDT,AVAXUSDT'
+$Symbols = 'SOLUSDT,DOGEUSDT,XRPUSDT,AVAXUSDT,ETHUSDT'
 $LogFile = 'D:\ai-trading-bot\live_bot.log'
 
 Write-Host '--------------------------------------------------------------'

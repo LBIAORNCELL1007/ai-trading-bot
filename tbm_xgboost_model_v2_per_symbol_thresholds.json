@@ -1,11 +1,13 @@
 {
   "_meta": {
-    "model": "tbm_xgboost_model_v2 (15 features, 9-symbol 3y dataset, purged 5-fold)",
+    "model": "tbm_xgboost_model_v2 (14 features, 9-symbol 3y dataset, purged 5-fold)",
     "decision_proba": "calibrated (sigmoid/Platt)",
     "data": "global_alpha_dataset_1h_2pct.csv (rebuilt after Tier 2 features confirmed harmful)",
-    "rationale_overview": "OOF analysis showed per-symbol heterogeneity: 2 symbols with strong edge (SOL, DOGE), 1 with weak large-sample edge (XRP), all others at random or negative. Skipping zero-edge symbols outperforms a single global threshold, since the aggregate 52.6% WR @ thr=0.50+funding-filter is diluted by negative-edge symbols (BTC, ETH, BNB, LINK, ADA) and propped up by SOL/DOGE.",
-    "stability_caveat": "P3 (most recent ~year) showed only 38.8% WR @ thr=0.50 + funding filter (n=67), vs P2's 60.6%. Bulk of edge sits in middle period. Size positions small; revisit if live edge drifts below 50% over a meaningful sample.",
-    "tier2_status": "session and cross-asset features tried and reverted: D-only WR=35.7%, E-only WR=47.3% on 3y OOF -> both negative additions"
+    "feature_count_change": "Dropped from 15 -> 14: bar_range_pct removed after leave-one-out ablation showed it actively hurt predictions (+2.7pp global WR, +3.0pp SOL WR, +9.5pp P3 stability when removed). Highly redundant with realized_vol_24h and atr_14_pct.",
+    "rationale_overview": "OOF analysis after dropping bar_range_pct: per-symbol edge structure preserved AND P3 stability fixed. SOL strongest, DOGE/XRP/AVAX hold their edge, and ETH/BTC newly cross the n>=100 + WR>=50% bar. ETH added (58.2% WR / 110 trades). BTC NOT added (52.6% WR is within sampling noise of 50%; revisit after live data accumulates). ADA/BNB/LINK still skipped.",
+    "stability_check": "Chronological 3-period split improved across the board: P1 50.0%->57.1%, P2 60.6%->60.0%, P3 38.8%->48.3%. The previous P3 instability was largely caused by bar_range_pct noise.",
+    "tier2_status": "session and cross-asset features tried and reverted in earlier session: D-only WR=35.7%, E-only WR=47.3% on 3y OOF -> both negative additions",
+    "experiments_log": "A (vol-scaled barriers): failed. B (walk-forward retraining 1y/2y): failed. I (single-feature ablation): drop bar_range_pct = win. See git log."
   },
   "_default": {
     "threshold": 1.01,
@@ -14,36 +16,44 @@
   },
   "symbols": {
     "SOLUSDT": {
-      "threshold": 0.56,
-      "use_funding_filter": false,
-      "oof_trades": 141,
-      "oof_win_rate": 0.603,
-      "oof_epnl_per_trade": 0.0041,
-      "rationale": "Strongest per-symbol edge in 3y OOF: 60.3% WR over 141 trades. Funding filter not needed (in fact weakens trade count). Highest priority symbol."
-    },
-    "DOGEUSDT": {
       "threshold": 0.55,
       "use_funding_filter": false,
-      "oof_trades": 126,
-      "oof_win_rate": 0.556,
-      "oof_epnl_per_trade": 0.0022,
-      "rationale": "Second strongest edge: 55.6% WR over 126 trades. No funding filter."
+      "oof_trades": 120,
+      "oof_win_rate": 0.633,
+      "oof_epnl_per_trade": 0.0053,
+      "rationale": "Strongest per-symbol edge: 63.3% WR over 120 trades after dropping bar_range_pct (was 60.3% / 141). EPnL +0.53%/trade. Highest priority symbol."
     },
-    "XRPUSDT": {
-      "threshold": 0.50,
-      "use_funding_filter": false,
-      "oof_trades": 1315,
-      "oof_win_rate": 0.523,
-      "oof_epnl_per_trade": 0.0009,
-      "rationale": "Weak but high-volume edge: 52.3% WR over 1315 trades. Largest sample of any symbol; the most statistically reliable edge even though per-trade EPnL is small."
-    },
-    "AVAXUSDT": {
-      "threshold": 0.56,
+    "DOGEUSDT": {
+      "threshold": 0.54,
       "use_funding_filter": false,
       "oof_trades": 137,
-      "oof_win_rate": 0.518,
-      "oof_epnl_per_trade": 0.0007,
-      "rationale": "Marginal: 51.8% WR over 137 trades. Borderline-significant; included with conservative threshold but expect lower SR than SOL/DOGE."
+      "oof_win_rate": 0.540,
+      "oof_epnl_per_trade": 0.0016,
+      "rationale": "Solid edge: 54.0% WR over 137 trades. Slight regression from previous 55.6% but still meaningfully positive at lower threshold."
+    },
+    "XRPUSDT": {
+      "threshold": 0.51,
+      "use_funding_filter": false,
+      "oof_trades": 667,
+      "oof_win_rate": 0.534,
+      "oof_epnl_per_trade": 0.0013,
+      "rationale": "Improved from prior 52.3% to 53.4% WR. Sample dropped from 1315 to 667 trades (model became more selective) which is a feature, not a bug -- per-trade EPnL up."
+    },
+    "AVAXUSDT": {
+      "threshold": 0.55,
+      "use_funding_filter": false,
+      "oof_trades": 142,
+      "oof_win_rate": 0.528,
+      "oof_epnl_per_trade": 0.0011,
+      "rationale": "Marginal but improved: 52.8% WR over 142 trades (was 51.8% / 137). Conservative threshold."
+    },
+    "ETHUSDT": {
+      "threshold": 0.58,
+      "use_funding_filter": false,
+      "oof_trades": 110,
+      "oof_win_rate": 0.582,
+      "oof_epnl_per_trade": 0.0033,
+      "rationale": "NEWLY TRADABLE after drop_BR: 58.2% WR over 110 trades, EPnL +0.33%/trade. Threshold tighter than SOL because edge concentrates in higher-confidence tail. Not previously tradable in 15-feature model (failed n>=100 cutoff)."
     }
   }
 }

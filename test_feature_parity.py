@@ -4,8 +4,9 @@ that match the rows in global_alpha_dataset_1h_2pct.csv for the same
 (symbol, timestamp).  Any drift here means live predictions disagree with
 backtested predictions and the model's edge becomes unverifiable.
 
-Tests all 15 features (Tier 2 features were tried + reverted as confirmed
-harmful — see oof_baseline15 vs oof_E_only / oof_D_only ablations).
+Tests all 14 features (was 15: bar_range_pct dropped after leave-one-out
+ablation showed it actively hurt predictions; Tier 2 features were tried +
+reverted as confirmed harmful in an earlier session).
 
 Run:  python test_feature_parity.py
 """

@@ -1,12 +1,29 @@
 {
-  "threshold": 0.50,
-  "scale": "calibrated",
-  "_meta": {
-    "model": "tbm_xgboost_model_v2 (15 features, 9-symbol 3y dataset, purged 5-fold)",
-    "purpose": "Global fallback ONLY. Live bot prefers tbm_xgboost_model_v2_per_symbol_thresholds.json (whose _default.threshold=1.01 means unlisted symbols are skipped). The trainer's auto-picked threshold of 0.69 is unreliable (only 2/233775 OOF rows cross it -> WR=1.0 is an artifact of n=2).",
-    "rationale": "thr=0.50 + funding_rate>0.0001 yields 52.6% WR over 266 OOF trades on the 3y rebuilt dataset. Used by the --threshold CLI override and by any symbol missing from the per-symbol JSON.",
-    "tier2_status": "session and cross-asset features tried and reverted; confirmed harmful (D-only OOF WR=35.7%, E-only=47.3% on the same 3y data).",
-    "trainer_emitted_threshold": 0.69,
-    "trainer_emitted_threshold_note": "Ignored: only 2 OOF rows cross 0.69 -> WR=1.0 is sample-size artifact, not a real edge."
-  }
+  "threshold": 0.6700000000000004,
+  "oof_f1": 8.557614137178554e-05,
+  "oof_brier": 0.2351010999293596,
+  "oof_expected_pnl_per_trade": 0.0084,
+  "oof_win_rate": 1.0,
+  "oof_trade_rate": 1.7110469468506043e-05,
+  "objective": "expected_pnl",
+  "tp_pct": 0.01,
+  "sl_pct": 0.01,
+  "fee_pct": 0.0008,
+  "grid_min": 0.2,
+  "grid_max": 0.8500000000000005,
+  "boundary_warning": false,
+  "fold_best_iter_mean": 73.4,
+  "fold_best_iter_std": 24.5161171477051,
+  "fold_best_iters": [
+    57,
+    71,
+    64,
+    54,
+    121
+  ],
+  "fold_unstable": false,
+  "n_splits": 5,
+  "embargo_pct": 0.01,
+  "method": "purged_kfold_with_uniqueness_weights",
+  "note": "Threshold maximises expected PnL per trade on calibrated OOF probabilities. boundary_warning=True means the optimum is at the search-grid edge -- do NOT trust this threshold for live trading."
 }

@@ -1,14 +1,24 @@
 """
 Live feature computation for the trading bot.
 
-Computes the EXACT same 15 features that train_tbm_model_v2.py was trained on
+Computes the EXACT same 14 features that train_tbm_model_v2.py was trained on
 (via build_global_dataset.py / global_alpha_dataset_1h_2pct.csv):
 
     close_fd_04, volume, funding_rate, volume_change_1h,
     buying_rejection, selling_rejection, realized_vol_24h,
-    rsi_14, atr_14_pct, bar_range_pct, volume_zscore_24h,
+    rsi_14, atr_14_pct, volume_zscore_24h,
     close_to_vwap_24h, funding_change_8h, funding_zscore_7d,
     funding_sign_streak
+
+NOTE on feature count: was 15; `bar_range_pct` was dropped after a leave-one-
+out feature-ablation experiment showed the model improves ~+2.7pp global WR
+and +3.0pp on SOL (highest-edge symbol) when bar_range_pct is removed --
+the feature actively HURT predictions, likely because (high - low)/close
+is highly correlated with realized_vol_24h and atr_14_pct but adds
+single-bar noise that was confusing the booster's split decisions.  The
+feature is still computed in build_global_dataset.py for backwards
+compatibility with the on-disk dataset, but is excluded from training
+via the trainer's DROP_COLS.
 
 Inputs to `compute_features`:
     - klines DataFrame indexed by closetime (DatetimeIndex), columns
@@ -18,7 +28,7 @@ Inputs to `compute_features`:
     - interval (e.g. "1h") to scale rolling windows.
 
 Output:
-    - DataFrame with the 15 feature columns above, indexed by bar close time.
+    - DataFrame with the 14 feature columns above, indexed by bar close time.
       The latest row may have NaN in long-window features if not enough
       history was provided -- caller should ensure ≥7 days of bars are passed.
 """
@@ -40,7 +50,6 @@ FEATURE_COLUMNS = [
     "realized_vol_24h",
     "rsi_14",
     "atr_14_pct",
-    "bar_range_pct",
     "volume_zscore_24h",
     "close_to_vwap_24h",
     "funding_change_8h",
