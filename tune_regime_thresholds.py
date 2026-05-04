@@ -33,6 +33,14 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import f1_score
 
+# Import the wrapper class so pickle can resolve it on load.
+# The calibrator artifact is an instance of this class when produced by
+# the purged-kfold path of train_tbm_model_v2.py.
+try:
+    from train_tbm_model_v2 import IsotonicCalibratorWrapper  # noqa: F401
+except ImportError:
+    pass
+
 
 DATA_FILE = "fracdiff_alpha_dataset.csv"
 OOF_FILE = "tbm_xgboost_model_v2_oof.csv"
@@ -41,8 +49,9 @@ OUTPUT_PATH = "tbm_xgboost_model_v2_regime_thresholds.json"
 
 
 def find_best_threshold(y_true, probas, grid=None):
+    # Wider grid so degenerate "always trade" / "never trade" optima surface.
     if grid is None:
-        grid = np.arange(0.30, 0.81, 0.01)
+        grid = np.arange(0.20, 0.851, 0.01)
     best_t, best_f1 = 0.5, -1.0
     for t in grid:
         pred = (probas >= t).astype(int)
@@ -69,7 +78,7 @@ def main():
         "--n-bins",
         type=int,
         default=4,
-        help="Number of quantile bins (default: 4 → quartiles).",
+        help="Number of quantile bins (default: 4 -> quartiles).",
     )
     parser.add_argument(
         "--min-bin-size",
@@ -78,10 +87,16 @@ def main():
         help="Minimum rows required per bin to fit a per-regime threshold "
         "(default: 200).  Bins below this size fall back to the global threshold.",
     )
+    parser.add_argument(
+        "--data",
+        type=str,
+        default=DATA_FILE,
+        help=f"Input CSV (default: {DATA_FILE}).",
+    )
     args = parser.parse_args()
 
-    print(f"Loading dataset from {DATA_FILE}...")
-    df = pd.read_csv(DATA_FILE)
+    print(f"Loading dataset from {args.data}...")
+    df = pd.read_csv(args.data)
     print(f"Loading OOF predictions from {OOF_FILE}...")
     oof = pd.read_csv(OOF_FILE)
     if len(oof) != len(df):
@@ -141,7 +156,7 @@ def main():
         n_pos = int(y[mask].sum())
         if n_b < args.min_bin_size or n_pos < 10 or n_pos == n_b:
             print(
-                f"  bin {b}: n={n_b} positives={n_pos}  → falling back to global "
+                f"  bin {b}: n={n_b} positives={n_pos}  -> falling back to global "
                 f"({global_t:.3f})"
             )
             per_bin_thresholds.append(global_t)
@@ -155,7 +170,7 @@ def main():
             {"bin": b, "n": n_b, "positives": n_pos, "f1": f1_b, "fallback": False}
         )
         print(
-            f"  bin {b}: n={n_b} positives={n_pos}  → threshold={t_b:.3f} "
+            f"  bin {b}: n={n_b} positives={n_pos}  -> threshold={t_b:.3f} "
             f"(F1={f1_b:.4f})"
         )
 

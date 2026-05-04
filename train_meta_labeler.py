@@ -52,6 +52,21 @@ from purged_kfold import PurgedKFold, compute_average_uniqueness
 warnings.filterwarnings("ignore")
 
 
+class IsotonicCalibratorWrapper:
+    """Module-level so pickle can find the class on load."""
+
+    def __init__(self, base, iso, feature_order):
+        self.base = base
+        self.iso = iso
+        self.feature_order = feature_order
+
+    def predict_proba(self, X):
+        X_ord = X[self.feature_order] if isinstance(X, pd.DataFrame) else X
+        raw = self.base.predict_proba(X_ord)[:, 1]
+        cal = np.clip(self.iso.transform(raw), 0.0, 1.0)
+        return np.column_stack([1.0 - cal, cal])
+
+
 # ── Configuration ────────────────────────────────────────────────────────────
 DATA_FILE = "fracdiff_alpha_dataset.csv"
 OOF_FILE = "tbm_xgboost_model_v2_oof.csv"
@@ -61,14 +76,15 @@ META_MODEL_PATH = "meta_xgboost_model.json"
 META_CALIB_PATH = "meta_xgboost_model_calibrated.pkl"
 META_THRESHOLD_PATH = "meta_xgboost_model_threshold.json"
 
-DROP_COLS = ["timestamp", "target_return_4h", "barrier_hit_time", "close_fd"]
+DROP_COLS = ["timestamp", "target_return_4h", "barrier_hit_time", "close_fd", "symbol"]
 TARGET_COL = "tbm_label"
 EMBARGO_FRACTION = 0.01
 
 
 def find_best_threshold(y_true, probas, grid=None):
+    # Wider grid (was 0.30-0.80) so a boundary-pinned optimum is visible.
     if grid is None:
-        grid = np.arange(0.30, 0.81, 0.01)
+        grid = np.arange(0.20, 0.851, 0.01)
     best_t, best_f1 = 0.5, -1.0
     for t in grid:
         pred = (probas >= t).astype(int)
@@ -80,9 +96,9 @@ def find_best_threshold(y_true, probas, grid=None):
     return float(best_t), float(best_f1)
 
 
-def load_inputs():
-    print(f"Loading dataset from {DATA_FILE}...")
-    df = pd.read_csv(DATA_FILE)
+def load_inputs(data_file: str = DATA_FILE):
+    print(f"Loading dataset from {data_file}...")
+    df = pd.read_csv(data_file)
 
     bht = (
         df["barrier_hit_time"].astype(int).values
@@ -117,9 +133,15 @@ def load_inputs():
 def main():
     parser = argparse.ArgumentParser(description="Train the meta-labeling classifier.")
     parser.add_argument("--n-splits", type=int, default=5)
+    parser.add_argument(
+        "--data",
+        type=str,
+        default=DATA_FILE,
+        help=f"Input CSV (default: {DATA_FILE}).",
+    )
     args = parser.parse_args()
 
-    X_full, y_full, p_primary, primary_threshold, bht_full = load_inputs()
+    X_full, y_full, p_primary, primary_threshold, bht_full = load_inputs(args.data)
 
     # 1. Restrict to rows where the primary said "act" — meta-labeling only
     #    cares about those.  Rows where the primary already abstained are
@@ -140,11 +162,57 @@ def main():
     # 2. Build the meta-target: was the primary right?
     meta_y = (y_full == 1).astype(int)
 
-    # 3. Subset to act rows; add the primary probability as an extra feature.
-    #    This lets the meta-model condition on the primary's confidence —
-    #    standard practice (López §3.6).
-    X_meta = X_full.loc[act_mask].copy()
-    X_meta["primary_proba"] = p_primary[act_mask]
+    # 3. Build the META feature space.
+    #
+    # Concern #4 fix: previously meta used the *entire primary feature set*
+    # plus `primary_proba`.  That gave meta the same view of the world as
+    # the primary, so meta learned the same decision boundary and abstained
+    # on ~1% of rows -- effectively identity.  For meta-labeling to add
+    # value (López §3.6) it must condition on *orthogonal* information:
+    # how confident the primary is, what *regime* the market is in, and
+    # signal-density features that the primary does not explicitly model.
+    #
+    # Orthogonal meta features:
+    #   - primary_proba                    (only primary-derived signal)
+    #   - realized_vol_24h, atr_14_pct     (volatility regime)
+    #   - rsi_14                           (mean-reversion / momentum regime)
+    #   - hour_of_day, day_of_week         (calendar effects)
+    #   - bars_since_last_signal           (signal-density / fatigue)
+    #
+    # We deliberately exclude direction-leaning features (close_fd_04,
+    # buying/selling_rejection, volume_change_1h) so meta cannot just
+    # re-derive the primary's signal.
+    REGIME_COLS = ["realized_vol_24h", "atr_14_pct", "rsi_14"]
+    available_regime = [c for c in REGIME_COLS if c in X_full.columns]
+
+    meta_full = pd.DataFrame(index=X_full.index)
+    meta_full["primary_proba"] = p_primary
+    for c in available_regime:
+        meta_full[c] = X_full[c].values
+
+    # Calendar features from the timestamp column on the source df.
+    # We re-load the timestamp here because X_full had it dropped.
+    src_df = pd.read_csv(args.data)
+    if "timestamp" in src_df.columns:
+        ts = pd.to_datetime(src_df["timestamp"])
+        meta_full["hour_of_day"] = ts.dt.hour.values
+        meta_full["day_of_week"] = ts.dt.dayofweek.values
+
+    # Bars since the previous primary "act" -- captures signal density.
+    # When acts cluster (chop), meta tends to learn "abstain"; when acts
+    # are sparse (clean trend), meta tends to learn "trust primary".
+    act_indicator = (p_primary >= primary_threshold).astype(int)
+    bars_since = np.zeros(len(act_indicator), dtype=float)
+    counter = 0
+    for i, a in enumerate(act_indicator):
+        bars_since[i] = counter
+        counter = 0 if a == 1 else counter + 1
+    meta_full["bars_since_last_signal"] = bars_since
+
+    print(f"Meta feature space (orthogonal to primary): {list(meta_full.columns)}")
+
+    # 4. Subset to act rows.
+    X_meta = meta_full.loc[act_mask].copy()
     y_meta = meta_y[act_mask]
     bht_meta = bht_full[act_mask] if bht_full is not None else None
 
@@ -250,18 +318,8 @@ def main():
     final_model.fit(X_meta, y_meta, sample_weight=weights, verbose=False)
 
     # Wrap in calibrator (isotonic on OOF, applied to final-model raw probs).
-    class IsotonicCalibratorWrapper:
-        def __init__(self, base, iso, feature_order):
-            self.base = base
-            self.iso = iso
-            self.feature_order = feature_order
-
-        def predict_proba(self, X):
-            X_ord = X[self.feature_order] if isinstance(X, pd.DataFrame) else X
-            raw = self.base.predict_proba(X_ord)[:, 1]
-            cal = np.clip(self.iso.transform(raw), 0.0, 1.0)
-            return np.column_stack([1.0 - cal, cal])
-
+    # IsotonicCalibratorWrapper is defined at module scope above so pickle
+    # can resolve the class when api.py loads the artifact.
     calibrator = IsotonicCalibratorWrapper(final_model, iso, list(X_meta.columns))
 
     # 7. Persist artifacts.

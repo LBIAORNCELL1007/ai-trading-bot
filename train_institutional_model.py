@@ -8,6 +8,13 @@ from sklearn.metrics import (
     f1_score,
 )
 from sklearn.calibration import CalibratedClassifierCV
+
+try:
+    from sklearn.frozen import FrozenEstimator
+
+    _HAS_FROZEN = True
+except ImportError:
+    _HAS_FROZEN = False
 import joblib
 import json
 
@@ -131,7 +138,12 @@ def train_institutional_model():
 
     # 7. Probability calibration on the validation set (prefit booster)
     print("\nCalibrating probabilities on validation set (isotonic, prefit)...")
-    calibrator = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
+    if _HAS_FROZEN:
+        calibrator = CalibratedClassifierCV(
+            FrozenEstimator(model), method="isotonic", cv=2
+        )
+    else:
+        calibrator = CalibratedClassifierCV(model, method="isotonic", cv="prefit")
     calibrator.fit(X_val, y_val)
 
     # 8. Threshold search on validation

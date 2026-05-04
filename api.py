@@ -10,6 +10,21 @@ import os
 import json
 import pickle
 
+# Import calibrator wrapper classes so pickle can resolve them on load.
+# These are produced by the purged-kfold paths of the training scripts.
+try:
+    from train_tbm_model_v2 import (
+        IsotonicCalibratorWrapper as _PrimaryCalibratorWrapper,  # noqa: F401
+    )
+except ImportError:
+    pass
+try:
+    from train_meta_labeler import (
+        IsotonicCalibratorWrapper as _MetaCalibratorWrapper,  # noqa: F401
+    )
+except ImportError:
+    pass
+
 """
 Institutional FastAPI Backend: Universal Blindness Model
 This microservice fetches live Binance Futures data, performs dynamic 
