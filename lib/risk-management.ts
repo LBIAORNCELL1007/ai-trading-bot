@@ -193,16 +193,49 @@ export class RiskManager {
   // ========================================================================
 
   /**
-   * Calculate stop-loss and take-profit prices from entry price
+   * Calculate stop-loss and take-profit prices.
+   *
+   * NOTE: `stopLossDistanceFraction` is the **price-distance** below entry as a
+   * fraction (e.g. 0.02 = SL at 2% below entry).  This is *NOT* the same as
+   * "risk-per-trade as % of equity" — those concepts are now decoupled.  For
+   * volatility-aware sizing call `setRiskRewardATR` instead.
    */
   setRiskReward(
     entryPrice: number,
-    riskPercent: number,
-    rewardMultiplier: number
+    stopLossDistanceFraction: number,
+    rewardMultiplier: number,
+    side: 'LONG' | 'SHORT' = 'LONG'
   ): { stopLoss: number; takeProfit: number } {
-    const stopLoss = entryPrice * (1 - riskPercent);
-    const takeProfit = entryPrice * (1 + riskPercent * rewardMultiplier);
+    const slDist = entryPrice * stopLossDistanceFraction;
+    const tpDist = slDist * rewardMultiplier;
+    const stopLoss = side === 'LONG' ? entryPrice - slDist : entryPrice + slDist;
+    const takeProfit = side === 'LONG' ? entryPrice + tpDist : entryPrice - tpDist;
     return { stopLoss, takeProfit };
+  }
+
+  /**
+   * Volatility-aware SL/TP using ATR.
+   *
+   * @param atrPercent ATR as % of entry price (e.g. 1.5 means ATR = 1.5% of price)
+   * @param slMultiplier SL distance = atrPercent × slMultiplier (default 1.5×)
+   * @param rrRatio TP distance = SL distance × rrRatio (default 2.0)
+   *
+   * Floors SL at 0.5% (avoid grazing on noise) and caps at 5% (avoid blow-up).
+   */
+  setRiskRewardATR(
+    entryPrice: number,
+    atrPercent: number,
+    slMultiplier = 1.5,
+    rrRatio = 2.0,
+    side: 'LONG' | 'SHORT' = 'LONG'
+  ): { stopLoss: number; takeProfit: number; slPercent: number; tpPercent: number } {
+    let slPct = Math.max(0.5, Math.min(5.0, atrPercent * slMultiplier));
+    const tpPct = slPct * rrRatio;
+    const slDist = entryPrice * (slPct / 100);
+    const tpDist = entryPrice * (tpPct / 100);
+    const stopLoss = side === 'LONG' ? entryPrice - slDist : entryPrice + slDist;
+    const takeProfit = side === 'LONG' ? entryPrice + tpDist : entryPrice - tpDist;
+    return { stopLoss, takeProfit, slPercent: slPct, tpPercent: tpPct };
   }
 
   /**

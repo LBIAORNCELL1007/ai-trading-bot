@@ -844,14 +844,18 @@ function calibrateParameters(
   let sl = atrPercent * 2 // 2x ATR as default
   let slReasoning = `ATR-based: ${atrPercent.toFixed(2)}% × 2 = ${(atrPercent * 2).toFixed(2)}%`
 
-  // Snap to volume node if nearby
+  // Snap to volume node ONLY if it sits at or beyond the noise floor.
+  // Floor = max(1× ATR, 0.8%).  A SL closer than 1 ATR is statistically inside
+  // normal-bar range and gets stopped out by noise (the original 0.3% rule).
   if (volumeNodes.length > 0) {
     const supportNode = volumeNodes.find(n => n.isSupport)
     if (supportNode && primaryInd.close > 0) {
       const nodeDistance = ((primaryInd.close - supportNode.price) / primaryInd.close) * 100
-      if (nodeDistance > 0.3 && nodeDistance < sl * 1.2) {
-        sl = Math.round(nodeDistance * 10) / 10
-        slReasoning = `Snapped to volume support node at $${supportNode.price.toFixed(2)} (${sl}% distance)`
+      const minSafeDistance = Math.max(atrPercent, 0.8) // ≥ 1 ATR
+      if (nodeDistance >= minSafeDistance && nodeDistance < sl * 1.5) {
+        // Snap to slightly below the node (give it room to wick through)
+        sl = Math.round((nodeDistance + atrPercent * 0.25) * 10) / 10
+        slReasoning = `Snapped to volume support node at $${supportNode.price.toFixed(2)} +0.25 ATR buffer (${sl}% distance, floor=${minSafeDistance.toFixed(2)}%)`
       }
     }
   }
@@ -967,8 +971,10 @@ function runPaperBacktest(
   let inTrade = false
   let tradeEntry = 0
   let tradeSide: 'BUY' | 'SELL' = 'BUY'
+  let entryBar = -1
   let highestSinceEntry = 0
   let lowestSinceEntry = Infinity
+  let pendingSignal: 'BUY' | 'SELL' | null = null
 
   // Pre-load first 20 candles for warmup
   for (let i = 0; i < Math.min(20, testKlines.length); i++) {
@@ -981,25 +987,25 @@ function runPaperBacktest(
     ti.addCandle(k.close, k.volume, k.high, k.low)
 
     const ind = ti.calculateAll()
-    const price = k.close
 
-    if (!inTrade) {
-      // Generate entry signal based on strategy
-      const signal = getSimpleSignal(strategy, ind, price)
-      if (signal !== 'HOLD') {
-        // Apply slippage on entry
-        tradeEntry = signal === 'BUY'
-          ? price * (1 + SLIPPAGE_PERCENT)
-          : price * (1 - SLIPPAGE_PERCENT)
-        tradeSide = signal
-        inTrade = true
-        highestSinceEntry = tradeEntry
-        lowestSinceEntry = tradeEntry
-      }
-    } else {
-      // Update trailing values
-      highestSinceEntry = Math.max(highestSinceEntry, price)
-      lowestSinceEntry = Math.min(lowestSinceEntry, price)
+    // ── 1. Fill pending entry at THIS bar's open (no look-ahead). ──
+    if (!inTrade && pendingSignal !== null) {
+      const fillPrice = k.open ?? k.close
+      tradeEntry = pendingSignal === 'BUY'
+        ? fillPrice * (1 + SLIPPAGE_PERCENT)
+        : fillPrice * (1 - SLIPPAGE_PERCENT)
+      tradeSide = pendingSignal
+      inTrade = true
+      entryBar = i
+      highestSinceEntry = tradeEntry
+      lowestSinceEntry = tradeEntry
+      pendingSignal = null
+    }
+
+    // ── 2. If in trade, check intrabar SL/TP/trailing using HIGH/LOW. ──
+    if (inTrade && i > entryBar) {
+      highestSinceEntry = Math.max(highestSinceEntry, k.high)
+      lowestSinceEntry = Math.min(lowestSinceEntry, k.low)
 
       let exitPrice = 0
       let shouldExit = false
@@ -1009,17 +1015,32 @@ function runPaperBacktest(
         const tpPrice = tradeEntry * (1 + tpPercent / 100)
         const trailPrice = highestSinceEntry * (1 - trailingPercent / 100)
 
-        if (price <= slPrice) { shouldExit = true; exitPrice = price * (1 - SLIPPAGE_PERCENT) }
-        else if (price >= tpPrice) { shouldExit = true; exitPrice = price * (1 - SLIPPAGE_PERCENT) }
-        else if (trailingPercent > 0 && price <= trailPrice) { shouldExit = true; exitPrice = price * (1 - SLIPPAGE_PERCENT) }
+        // Conservative ordering: assume SL hits first if both are in-range
+        if (k.low <= slPrice) {
+          shouldExit = true
+          exitPrice = slPrice * (1 - SLIPPAGE_PERCENT)
+        } else if (k.high >= tpPrice) {
+          shouldExit = true
+          exitPrice = tpPrice * (1 - SLIPPAGE_PERCENT)
+        } else if (trailingPercent > 0 && k.low <= trailPrice) {
+          shouldExit = true
+          exitPrice = trailPrice * (1 - SLIPPAGE_PERCENT)
+        }
       } else {
         const slPrice = tradeEntry * (1 + slPercent / 100)
         const tpPrice = tradeEntry * (1 - tpPercent / 100)
         const trailPrice = lowestSinceEntry * (1 + trailingPercent / 100)
 
-        if (price >= slPrice) { shouldExit = true; exitPrice = price * (1 + SLIPPAGE_PERCENT) }
-        else if (price <= tpPrice) { shouldExit = true; exitPrice = price * (1 + SLIPPAGE_PERCENT) }
-        else if (trailingPercent > 0 && price >= trailPrice) { shouldExit = true; exitPrice = price * (1 + SLIPPAGE_PERCENT) }
+        if (k.high >= slPrice) {
+          shouldExit = true
+          exitPrice = slPrice * (1 + SLIPPAGE_PERCENT)
+        } else if (k.low <= tpPrice) {
+          shouldExit = true
+          exitPrice = tpPrice * (1 + SLIPPAGE_PERCENT)
+        } else if (trailingPercent > 0 && k.high >= trailPrice) {
+          shouldExit = true
+          exitPrice = trailPrice * (1 + SLIPPAGE_PERCENT)
+        }
       }
 
       if (shouldExit) {
@@ -1031,7 +1052,15 @@ function runPaperBacktest(
         else { losses++; grossLoss += Math.abs(pnl) }
 
         inTrade = false
+        entryBar = -1
       }
+    }
+
+    // ── 3. Generate signal on the close of the *current* bar to fill on
+    //       the *next* bar's open.  This eliminates look-ahead bias.  ──
+    if (!inTrade && pendingSignal === null) {
+      const signal = getSimpleSignal(strategy, ind, k.close)
+      if (signal !== 'HOLD') pendingSignal = signal
     }
   }
 
@@ -1246,13 +1275,28 @@ export class AIConfigEngine {
     let selectedStrategy = strategyScores[0].key
     let strategyReasoning = strategyScores[0].reasoning
 
-    // If top 2 are within 5 points, default to MULTI_SIGNAL for safety
+    // Strategy-selection tie-breaker.
+    //
+    // The original logic said "if top 2 are within 5 points, default to
+    // MULTI_SIGNAL".  That is wrong:  MULTI_SIGNAL has the *lowest* per-trade
+    // edge of all strategies (it requires multi-strategy confluence which is
+    // rare), so falling back to it whenever there's any ambiguity meant we
+    // were systematically picking the *weakest* signal generator.  The fix:
+    //
+    //   • If only the top 2 are close (within 5 pts) — keep top 1 (it won).
+    //   • Only fall back to MULTI_SIGNAL when top *3* are all within 5 pts
+    //     of each other AND none of them is itself MULTI_SIGNAL — i.e. there
+    //     is genuine 3-way ambiguity, in which case ensemble voting helps.
+    //   • Never override an already-selected MULTI_SIGNAL.
     if (
-      strategyScores.length >= 2 &&
-      strategyScores[0].score - strategyScores[1].score < 5
+      strategyScores.length >= 3 &&
+      strategyScores[0].score - strategyScores[2].score < 5 &&
+      strategyScores[0].key !== 'MULTI_SIGNAL' &&
+      strategyScores[1].key !== 'MULTI_SIGNAL' &&
+      strategyScores[2].key !== 'MULTI_SIGNAL'
     ) {
       selectedStrategy = 'MULTI_SIGNAL'
-      strategyReasoning = `Top strategies too close (${strategyScores[0].key}: ${strategyScores[0].score} vs ${strategyScores[1].key}: ${strategyScores[1].score}) — defaulting to Multi-Signal Ensemble for diversification`
+      strategyReasoning = `Top 3 strategies near-tied (${strategyScores[0].key}:${strategyScores[0].score}, ${strategyScores[1].key}:${strategyScores[1].score}, ${strategyScores[2].key}:${strategyScores[2].score}) — using Multi-Signal Ensemble for confluence-only entries`
     }
 
     // ── Step 7: Parameter Calibration ──

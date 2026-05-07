@@ -12,6 +12,7 @@ import {
   mean,
   std,
 } from "./math-utils"
+import { calibrateProbabilities } from "./strategy-engine"
 
 // ===== FEATURE ENGINEERING =====
 
@@ -315,7 +316,16 @@ export interface ModelPrediction {
 export function predictDirection(
   prices: number[],
   volumes: number[] = [],
-  tcnModel?: SimpleTCN
+  tcnModel?: SimpleTCN,
+  /**
+   * Optional probability calibrator (isotonic-regression mapping fitted on
+   * a held-out validation set via `calibrateProbabilities`).  If provided,
+   * the ensemble's raw probability is mapped to an empirically-calibrated
+   * win-probability before being returned.  Without calibration, `probability`
+   * is the *raw model output* and should NEVER be compared against fixed
+   * thresholds like 0.55 — see `optimizeThreshold` for data-driven tuning.
+   */
+  calibrator?: (p: number) => number
 ): ModelPrediction {
   if (prices.length < 10) {
     return {
@@ -351,7 +361,10 @@ export function predictDirection(
   const techSignal = (rsiSignal + macdSignal + bbSignal) / 3
 
   // Ensemble: weighted average
-  const probability = tcnPred * 0.4 + tdaPred * 0.3 + techSignal * 0.3
+  const rawProbability = tcnPred * 0.4 + tdaPred * 0.3 + techSignal * 0.3
+  const probability = calibrator
+    ? Math.min(1, Math.max(0, calibrator(Math.min(1, Math.max(0, rawProbability)))))
+    : Math.min(1, Math.max(0, rawProbability))
   const confidence = Math.min(
     1,
     Math.abs(probability - 0.5) * 2 +
@@ -359,7 +372,7 @@ export function predictDirection(
   )
 
   return {
-    probability: Math.min(1, Math.max(0, probability)),
+    probability,
     confidence,
     signals: {
       tcn: tcnPred,
@@ -447,4 +460,69 @@ export function backtest(
     winRate: Math.min(1, Math.max(0, winRate)),
     totalTrades: trades.length,
   }
+}
+
+// ===== CALIBRATION + THRESHOLD OPTIMIZATION =====
+
+/**
+ * Fit an isotonic-regression calibrator on a validation set.
+ *
+ * Use this once on held-out data BEFORE deploying.  The returned function
+ * maps raw ensemble probabilities to empirically-calibrated win probabilities.
+ *
+ * @param rawProbs   raw ensemble probabilities from `predictDirection` (uncalibrated)
+ * @param outcomes   binary outcomes (1 = price went up over horizon, 0 = down)
+ * @param bins       number of binning buckets for PAVA (default 15)
+ */
+export function fitCalibrator(
+  rawProbs: number[],
+  outcomes: number[],
+  bins = 15
+): (p: number) => number {
+  return calibrateProbabilities(rawProbs, outcomes, bins)
+}
+
+/**
+ * Find the entry-threshold that maximises Sharpe ratio (with a minimum-trade
+ * gate) on a validation set.  Replaces hard-coded 0.55 / 0.45 thresholds.
+ *
+ * The threshold is symmetric: if optimal is τ then BUY when prob > τ and
+ * SELL when prob < 1 − τ.
+ *
+ * @param prices       validation-set price series (aligned with predictions)
+ * @param predictions  validation-set predictions (aligned with prices)
+ * @param minTrades    minimum number of round-trips required to trust a
+ *                     threshold (default 10) — avoids picking a threshold that
+ *                     fires once and gets lucky
+ * @param grid         threshold candidates (default 0.50 → 0.75 step 0.01)
+ */
+export function optimizeThreshold(
+  prices: number[],
+  predictions: ModelPrediction[],
+  minTrades = 10,
+  grid: number[] = Array.from({ length: 26 }, (_, i) => 0.5 + i * 0.01)
+): { threshold: number; sharpe: number; result: BacktestResult } {
+  let bestThreshold = 0.55
+  let bestSharpe = -Infinity
+  let bestResult: BacktestResult = {
+    totalReturn: 0,
+    sharpeRatio: 0,
+    maxDrawdown: 0,
+    winRate: 0,
+    totalTrades: 0,
+  }
+
+  for (const t of grid) {
+    const r = backtest(prices, predictions, t)
+    if (r.totalTrades < minTrades) continue
+    // Combined score: Sharpe primary, with a small win-rate tiebreaker
+    const score = r.sharpeRatio + r.winRate * 0.1
+    if (score > bestSharpe) {
+      bestSharpe = score
+      bestThreshold = t
+      bestResult = r
+    }
+  }
+
+  return { threshold: bestThreshold, sharpe: bestResult.sharpeRatio, result: bestResult }
 }

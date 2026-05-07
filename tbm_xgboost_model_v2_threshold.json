@@ -1,0 +1,12 @@
+{
+  "threshold": 0.50,
+  "scale": "calibrated",
+  "_meta": {
+    "model": "tbm_xgboost_model_v2 (15 features, 9-symbol 3y dataset, purged 5-fold)",
+    "purpose": "Global fallback ONLY. Live bot prefers tbm_xgboost_model_v2_per_symbol_thresholds.json (whose _default.threshold=1.01 means unlisted symbols are skipped). The trainer's auto-picked threshold of 0.69 is unreliable (only 2/233775 OOF rows cross it -> WR=1.0 is an artifact of n=2).",
+    "rationale": "thr=0.50 + funding_rate>0.0001 yields 52.6% WR over 266 OOF trades on the 3y rebuilt dataset. Used by the --threshold CLI override and by any symbol missing from the per-symbol JSON.",
+    "tier2_status": "session and cross-asset features tried and reverted; confirmed harmful (D-only OOF WR=35.7%, E-only=47.3% on the same 3y data).",
+    "trainer_emitted_threshold": 0.69,
+    "trainer_emitted_threshold_note": "Ignored: only 2 OOF rows cross 0.69 -> WR=1.0 is sample-size artifact, not a real edge."
+  }
+}

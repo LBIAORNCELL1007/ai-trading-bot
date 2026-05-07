@@ -20,9 +20,20 @@ export interface StrategicDecision {
 }
 
 /**
- * @deprecated This orchestrator is not yet integrated into TradingEngine.
- * It runs standalone and its strategy recommendations are not applied.
- * TODO: Wire decide() into the trading loop.
+ * AgenticOrchestrator — top-down regime detector and meta-strategy selector.
+ *
+ * Wired into TradingEngine.executeStrategy() (gated by config.useAgenticOrchestrator,
+ * default ON).  On every closed bar the orchestrator:
+ *   • detects market regime from MarketAnalysis + IndicatorData
+ *   • returns a recommendedStrategy + riskMultiplier (0.5–2.0×) + tpMultiplier
+ *   • applies "stickiness" (5-min linger) to prevent whipsaw strategy switching
+ *   • penalises strategies with ≥3 consecutive losses (forced halving of confidence)
+ *   • feeds outcome back via recordTradeResult on every closed trade
+ *
+ * The TradingEngine consumes:
+ *   • decision.confidence  → veto if < 0.5; force-skip if regime mismatch ≥ 0.75
+ *   • decision.riskMultiplier → scales setMaxRiskPerTrade for this entry only
+ *   • decision.tpMultiplier   → scales rewardMultiplier (R:R ratio) for this entry only
  */
 export class AgenticOrchestrator {
     private lastStrategy: string = 'MULTI_SIGNAL';

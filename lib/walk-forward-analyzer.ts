@@ -1,6 +1,15 @@
 import { BinanceKline } from "./binance-websocket";
 
 // ════════════════════════════════════════════════════════════════════════════
+// COSTS — every simulator now applies these.  Without them the analyzer
+// wildly over-estimates PnL of high-frequency strategies (mean-reversion,
+// MACD) which look great gross-of-fees but break-even or lose net.
+// ════════════════════════════════════════════════════════════════════════════
+const TAKER_FEE_PCT = 0.0004;   // Binance spot taker (≈0.04%)
+const SLIPPAGE_PCT  = 0.0005;   // 5 bp per fill — conservative for crypto majors
+const ROUND_TRIP_COST = 2 * (TAKER_FEE_PCT + SLIPPAGE_PCT); // entry+exit
+
+// ════════════════════════════════════════════════════════════════════════════
 // TYPES
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -16,12 +25,19 @@ export interface BacktestResult {
     outOfSamplePnL: number;
     inSamplePnLPercent: number;
     outOfSamplePnLPercent: number;
+    inSampleSharpe: number;
+    outOfSampleSharpe: number;
     tradesInSample: number;
     tradesOutOfSample: number;
     winRateInSample: number;
     winRateOutOfSample: number;
     isRobust: boolean;
     plateauScore: number;
+    /**
+     * Per-fold OOS Sharpe ratios (when produced by `runRollingWalkForward`).
+     * Empty for the legacy single-split path.
+     */
+    foldSharpes?: number[];
 }
 
 export interface WFAReport {
@@ -36,6 +52,16 @@ export interface WFAReport {
     topResults: BacktestResult[]; // Top 5
     allResults: BacktestResult[];
     timestamp: Date;
+    /** Number of folds (1 for legacy single-split, N for rolling WFA). */
+    foldsUsed: number;
+}
+
+interface SimResult {
+    pnl: number;            // sum of per-trade fractional returns (already net of fees)
+    trades: number;
+    wins: number;
+    /** Per-trade fractional returns (net of fees) — used to compute Sharpe. */
+    returns: number[];
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -56,8 +82,43 @@ export class WalkForwardAnalyzer {
     }
 
     /**
+     * Generate rolling walk-forward windows.  Each window has its own
+     * in-sample (train) and out-of-sample (test) slice, sliding forward by
+     * the test-window size.  This is the *correct* WFA — not a one-off split.
+     *
+     * Example with totalCandles=1000, trainSize=400, testSize=100, step=100:
+     *   Fold 0:  IS [0..400),     OOS [400..500)
+     *   Fold 1:  IS [100..500),   OOS [500..600)
+     *   Fold 2:  IS [200..600),   OOS [600..700)
+     *   ...
+     */
+    static rollingWindows(
+        data: BinanceKline[],
+        trainSize: number,
+        testSize: number,
+        step: number = testSize
+    ): { inSample: BinanceKline[]; outOfSample: BinanceKline[] }[] {
+        const folds: { inSample: BinanceKline[]; outOfSample: BinanceKline[] }[] = [];
+        for (let start = 0; start + trainSize + testSize <= data.length; start += step) {
+            folds.push({
+                inSample: data.slice(start, start + trainSize),
+                outOfSample: data.slice(start + trainSize, start + trainSize + testSize),
+            });
+        }
+        return folds;
+    }
+
+    /**
      * Main entry point — runs WFA across multiple strategies and parameters.
-     * Returns a rich report with ranked results.
+     *
+     * Selection criterion (CHANGED — was: rank by OOS PnL, which is textbook
+     * data-snooping bias):
+     *   1. Filter to params that are profitable in-sample AND OOS (`isRobust`)
+     *   2. Rank by **in-sample Sharpe** (the unbiased optimisation criterion)
+     *   3. Tie-break by plateau score (parameter-stability)
+     *   4. Report OOS Sharpe / PnL as out-of-sample *evidence*, not driver
+     *
+     * This eliminates the bias of picking the lucky-on-OOS parameter set.
      */
     static runAnalysis(
         klines: BinanceKline[],
@@ -78,12 +139,172 @@ export class WalkForwardAnalyzer {
             topResults: [],
             allResults: [],
             timestamp: new Date(),
+            foldsUsed: 1,
         };
 
         if (inSample.length < 50 || outOfSample.length < 20) {
             return report;
         }
 
+        const allResults = this.runOnSplit(inSample, outOfSample);
+        report.strategiesTested = 5;
+        report.paramCombinationsTested = allResults.length;
+        report.allResults = allResults;
+
+        // Calculate plateau scores for robustness
+        this.calculatePlateauScores(allResults);
+
+        // ── SELECTION: rank by IN-SAMPLE Sharpe (no data-snooping bias) ──
+        const sorted = [...allResults]
+            .filter(r => r.isRobust && r.tradesInSample >= 5 && r.tradesOutOfSample >= 3)
+            .sort((a, b) => {
+                // Primary: in-sample Sharpe
+                // Secondary: plateau score (parameter stability — neighbors also profitable)
+                const scoreA = a.inSampleSharpe + a.plateauScore * 0.05;
+                const scoreB = b.inSampleSharpe + b.plateauScore * 0.05;
+                return scoreB - scoreA;
+            });
+
+        report.topResults = sorted.slice(0, 5);
+        report.bestResult = sorted[0] || null;
+
+        return report;
+    }
+
+    /**
+     * Rolling walk-forward — N folds, each fold:
+     *   • train on `trainSize` bars
+     *   • test on `testSize` bars
+     *   • slide forward by `step`
+     *
+     * For each parameter set, mean and std of OOS-Sharpe across folds is
+     * tracked.  Selection picks the param-set with the highest **mean OOS
+     * Sharpe**, regularised by a stability term (minus std/2) so erratic
+     * winners are penalised.
+     *
+     * This is the textbook WFA from López de Prado §11 and is the only honest
+     * way to evaluate parameter robustness for live trading.
+     */
+    static runRollingWalkForward(
+        klines: BinanceKline[],
+        symbol: string = 'UNKNOWN',
+        timeframe: string = '15m',
+        trainSize: number = 400,
+        testSize: number = 100,
+        step: number = 100
+    ): WFAReport {
+        const folds = this.rollingWindows(klines, trainSize, testSize, step);
+
+        const report: WFAReport = {
+            symbol,
+            timeframe,
+            totalCandlesUsed: klines.length,
+            inSampleSize: trainSize,
+            outOfSampleSize: testSize,
+            strategiesTested: 5,
+            paramCombinationsTested: 0,
+            bestResult: null,
+            topResults: [],
+            allResults: [],
+            timestamp: new Date(),
+            foldsUsed: folds.length,
+        };
+
+        if (folds.length === 0) return report;
+
+        // For each parameter-id, accumulate per-fold stats
+        const accumulated = new Map<string, BacktestResult & { isPnls: number[]; osPnls: number[] }>();
+
+        for (const fold of folds) {
+            const foldResults = this.runOnSplit(fold.inSample, fold.outOfSample);
+            for (const r of foldResults) {
+                const key = r.parameterSet.id;
+                if (!accumulated.has(key)) {
+                    accumulated.set(key, {
+                        ...r,
+                        foldSharpes: [],
+                        isPnls: [],
+                        osPnls: [],
+                        // reset cumulative fields — we'll average them
+                        inSamplePnL: 0,
+                        outOfSamplePnL: 0,
+                        inSamplePnLPercent: 0,
+                        outOfSamplePnLPercent: 0,
+                        inSampleSharpe: 0,
+                        outOfSampleSharpe: 0,
+                        tradesInSample: 0,
+                        tradesOutOfSample: 0,
+                        winRateInSample: 0,
+                        winRateOutOfSample: 0,
+                    });
+                }
+                const acc = accumulated.get(key)!;
+                acc.foldSharpes!.push(r.outOfSampleSharpe);
+                acc.isPnls.push(r.inSamplePnLPercent);
+                acc.osPnls.push(r.outOfSamplePnLPercent);
+                acc.inSamplePnL += r.inSamplePnL;
+                acc.outOfSamplePnL += r.outOfSamplePnL;
+                acc.inSamplePnLPercent += r.inSamplePnLPercent;
+                acc.outOfSamplePnLPercent += r.outOfSamplePnLPercent;
+                acc.inSampleSharpe += r.inSampleSharpe;
+                acc.outOfSampleSharpe += r.outOfSampleSharpe;
+                acc.tradesInSample += r.tradesInSample;
+                acc.tradesOutOfSample += r.tradesOutOfSample;
+                acc.winRateInSample += r.winRateInSample;
+                acc.winRateOutOfSample += r.winRateOutOfSample;
+            }
+        }
+
+        // Average per-fold metrics
+        const all: BacktestResult[] = [];
+        for (const acc of accumulated.values()) {
+            const n = acc.foldSharpes!.length;
+            const meanIsSharpe = acc.inSampleSharpe / n;
+            const meanOsSharpe = acc.outOfSampleSharpe / n;
+            all.push({
+                parameterSet: acc.parameterSet,
+                inSamplePnL: acc.inSamplePnL / n,
+                outOfSamplePnL: acc.outOfSamplePnL / n,
+                inSamplePnLPercent: acc.inSamplePnLPercent / n,
+                outOfSamplePnLPercent: acc.outOfSamplePnLPercent / n,
+                inSampleSharpe: meanIsSharpe,
+                outOfSampleSharpe: meanOsSharpe,
+                tradesInSample: Math.round(acc.tradesInSample / n),
+                tradesOutOfSample: Math.round(acc.tradesOutOfSample / n),
+                winRateInSample: acc.winRateInSample / n,
+                winRateOutOfSample: acc.winRateOutOfSample / n,
+                isRobust: meanOsSharpe > 0 && meanIsSharpe > 0,
+                plateauScore: 0,
+                foldSharpes: acc.foldSharpes,
+            });
+        }
+
+        report.allResults = all;
+        report.paramCombinationsTested = all.length;
+
+        this.calculatePlateauScores(all);
+
+        // SELECTION: mean OOS Sharpe minus stability penalty (std/2)
+        const sorted = [...all]
+            .filter(r => r.isRobust && r.tradesOutOfSample >= 3)
+            .sort((a, b) => {
+                const stdA = stddev(a.foldSharpes ?? [a.outOfSampleSharpe]);
+                const stdB = stddev(b.foldSharpes ?? [b.outOfSampleSharpe]);
+                const scoreA = a.outOfSampleSharpe - stdA * 0.5 + a.plateauScore * 0.05;
+                const scoreB = b.outOfSampleSharpe - stdB * 0.5 + b.plateauScore * 0.05;
+                return scoreB - scoreA;
+            });
+
+        report.topResults = sorted.slice(0, 5);
+        report.bestResult = sorted[0] || null;
+
+        return report;
+    }
+
+    /**
+     * Run all strategies × params on a single (in-sample, out-of-sample) split.
+     */
+    private static runOnSplit(inSample: BinanceKline[], outOfSample: BinanceKline[]): BacktestResult[] {
         const allResults: BacktestResult[] = [];
 
         // ── Strategy 1: Mean Reversion (Bollinger Band std dev) ──
@@ -97,7 +318,6 @@ export class WalkForwardAnalyzer {
             const os = this.simulateMeanReversion(outOfSample, dev, 20);
             allResults.push(this.buildResult(paramSet, is, os, inSample, outOfSample));
         }
-        report.strategiesTested++;
 
         // ── Strategy 2: MA Crossover (fast/slow period combos) ──
         const fastPeriods = [5, 10, 15, 20];
@@ -115,7 +335,6 @@ export class WalkForwardAnalyzer {
                 allResults.push(this.buildResult(paramSet, is, os, inSample, outOfSample));
             }
         }
-        report.strategiesTested++;
 
         // ── Strategy 3: RSI Reversal (overbought/oversold thresholds) ──
         for (let ob = 65; ob <= 80; ob += 5) {
@@ -130,9 +349,8 @@ export class WalkForwardAnalyzer {
                 allResults.push(this.buildResult(paramSet, is, os, inSample, outOfSample));
             }
         }
-        report.strategiesTested++;
 
-        // ── Strategy 4: MACD (signal period variations) ──
+        // ── Strategy 4: MACD ──
         const macdConfigs = [
             { fast: 8, slow: 21, signal: 5 },
             { fast: 12, slow: 26, signal: 9 },
@@ -149,9 +367,8 @@ export class WalkForwardAnalyzer {
             const os = this.simulateMACD(outOfSample, cfg.fast, cfg.slow, cfg.signal);
             allResults.push(this.buildResult(paramSet, is, os, inSample, outOfSample));
         }
-        report.strategiesTested++;
 
-        // ── Strategy 5: Breakout (ATR multiplier for channel) ──
+        // ── Strategy 5: ATR Breakout ──
         for (let mult = 1.0; mult <= 3.0; mult += 0.5) {
             const paramSet: ParameterSet = {
                 id: `Breakout-ATR(${mult.toFixed(1)}x)`,
@@ -162,31 +379,13 @@ export class WalkForwardAnalyzer {
             const os = this.simulateBreakout(outOfSample, mult, 14);
             allResults.push(this.buildResult(paramSet, is, os, inSample, outOfSample));
         }
-        report.strategiesTested++;
 
-        report.paramCombinationsTested = allResults.length;
-        report.allResults = allResults;
-
-        // Calculate plateau scores for robustness
-        this.calculatePlateauScores(allResults);
-
-        // Sort by composite score: OOS PnL% + plateau score (favors consistent + profitable)
-        const sorted = [...allResults]
-            .filter(r => r.outOfSamplePnL > 0 && r.inSamplePnL > 0)
-            .sort((a, b) => {
-                const scoreA = a.outOfSamplePnLPercent + a.plateauScore * 0.5;
-                const scoreB = b.outOfSamplePnLPercent + b.plateauScore * 0.5;
-                return scoreB - scoreA;
-            });
-
-        report.topResults = sorted.slice(0, 5);
-        report.bestResult = sorted[0] || null;
-
-        return report;
+        return allResults;
     }
 
     // ════════════════════════════════════════════════════════════════
-    // STRATEGY SIMULATORS
+    // STRATEGY SIMULATORS — all return per-trade *fractional returns net
+    // of round-trip fees + slippage*.
     // ════════════════════════════════════════════════════════════════
 
     private static buildResult(
@@ -202,26 +401,35 @@ export class WalkForwardAnalyzer {
             parameterSet: paramSet,
             inSamplePnL: is.pnl,
             outOfSamplePnL: os.pnl,
-            inSamplePnLPercent: (is.pnl / isStartPrice) * 100,
-            outOfSamplePnLPercent: (os.pnl / osStartPrice) * 100,
+            // PnL% is the SUM of fractional returns × 100.  Each return is
+            // already net of fees/slippage in the simulator.
+            inSamplePnLPercent: is.pnl * 100,
+            outOfSamplePnLPercent: os.pnl * 100,
+            inSampleSharpe: sharpe(is.returns),
+            outOfSampleSharpe: sharpe(os.returns),
             tradesInSample: is.trades,
             tradesOutOfSample: os.trades,
             winRateInSample: is.trades > 0 ? (is.wins / is.trades) * 100 : 0,
             winRateOutOfSample: os.trades > 0 ? (os.wins / os.trades) * 100 : 0,
             isRobust: os.pnl > 0 && is.pnl > 0,
             plateauScore: 0,
+            // ignore unused variable
+            ...(isStartPrice && osStartPrice ? {} : {}),
         };
     }
 
-    /**
-     * Mean Reversion using Bollinger Bands.
-     */
+    private static recordTrade(entry: number, exit: number, side: 'long' | 'short' = 'long'): number {
+        // Fractional return net of round-trip cost
+        const grossRet = side === 'long' ? (exit - entry) / entry : (entry - exit) / entry;
+        return grossRet - ROUND_TRIP_COST;
+    }
+
     private static simulateMeanReversion(
         klines: BinanceKline[], stdDevMultiplier: number, period: number = 20
     ): SimResult {
-        if (klines.length < period) return { pnl: 0, trades: 0, wins: 0 };
+        if (klines.length < period) return { pnl: 0, trades: 0, wins: 0, returns: [] };
         const closes = klines.map(k => k.close);
-        let pnl = 0, trades = 0, wins = 0;
+        const out: SimResult = { pnl: 0, trades: 0, wins: 0, returns: [] };
         let position: number | null = null;
 
         for (let i = period; i < closes.length; i++) {
@@ -236,32 +444,27 @@ export class WalkForwardAnalyzer {
             if (position === null && price < lower) {
                 position = price;
             } else if (position !== null && price > upper) {
-                const tradePnl = price - position;
-                pnl += tradePnl;
-                trades++;
-                if (tradePnl > 0) wins++;
+                const r = this.recordTrade(position, price);
+                out.pnl += r; out.returns.push(r); out.trades++;
+                if (r > 0) out.wins++;
                 position = null;
             }
         }
         if (position !== null) {
-            const tradePnl = closes[closes.length - 1] - position;
-            pnl += tradePnl; trades++;
-            if (tradePnl > 0) wins++;
+            const r = this.recordTrade(position, closes[closes.length - 1]);
+            out.pnl += r; out.returns.push(r); out.trades++;
+            if (r > 0) out.wins++;
         }
-        return { pnl, trades, wins };
+        return out;
     }
 
-    /**
-     * Moving Average Crossover.
-     */
     private static simulateMovingAvgCross(
         klines: BinanceKline[], fastPeriod: number, slowPeriod: number
     ): SimResult {
-        if (klines.length < slowPeriod + 1) return { pnl: 0, trades: 0, wins: 0 };
+        if (klines.length < slowPeriod + 1) return { pnl: 0, trades: 0, wins: 0, returns: [] };
         const closes = klines.map(k => k.close);
-        let pnl = 0, trades = 0, wins = 0;
+        const out: SimResult = { pnl: 0, trades: 0, wins: 0, returns: [] };
         let position: number | null = null;
-        let positionSide: 'long' | null = null;
 
         const sma = (arr: number[], p: number, end: number) => {
             const slice = arr.slice(end - p, end);
@@ -276,40 +479,31 @@ export class WalkForwardAnalyzer {
             const slow = sma(closes, slowPeriod, i);
             const price = closes[i];
 
-            // Golden cross: fast crosses above slow
             if (prevFast <= prevSlow && fast > slow && position === null) {
                 position = price;
-                positionSide = 'long';
-            }
-            // Death cross: fast crosses below slow — exit long
-            else if (prevFast >= prevSlow && fast < slow && position !== null) {
-                const tradePnl = price - position;
-                pnl += tradePnl;
-                trades++;
-                if (tradePnl > 0) wins++;
+            } else if (prevFast >= prevSlow && fast < slow && position !== null) {
+                const r = this.recordTrade(position, price);
+                out.pnl += r; out.returns.push(r); out.trades++;
+                if (r > 0) out.wins++;
                 position = null;
             }
-
             prevFast = fast;
             prevSlow = slow;
         }
         if (position !== null) {
-            const tradePnl = closes[closes.length - 1] - position;
-            pnl += tradePnl; trades++;
-            if (tradePnl > 0) wins++;
+            const r = this.recordTrade(position, closes[closes.length - 1]);
+            out.pnl += r; out.returns.push(r); out.trades++;
+            if (r > 0) out.wins++;
         }
-        return { pnl, trades, wins };
+        return out;
     }
 
-    /**
-     * RSI Reversal strategy.
-     */
     private static simulateRSI(
         klines: BinanceKline[], oversold: number, overbought: number, period: number
     ): SimResult {
-        if (klines.length < period + 2) return { pnl: 0, trades: 0, wins: 0 };
+        if (klines.length < period + 2) return { pnl: 0, trades: 0, wins: 0, returns: [] };
         const closes = klines.map(k => k.close);
-        let pnl = 0, trades = 0, wins = 0;
+        const out: SimResult = { pnl: 0, trades: 0, wins: 0, returns: [] };
         let position: number | null = null;
 
         for (let i = period + 1; i < closes.length; i++) {
@@ -319,86 +513,70 @@ export class WalkForwardAnalyzer {
             if (position === null && rsi < oversold) {
                 position = price;
             } else if (position !== null && rsi > overbought) {
-                const tradePnl = price - position;
-                pnl += tradePnl;
-                trades++;
-                if (tradePnl > 0) wins++;
+                const r = this.recordTrade(position, price);
+                out.pnl += r; out.returns.push(r); out.trades++;
+                if (r > 0) out.wins++;
                 position = null;
             }
         }
         if (position !== null) {
-            const tradePnl = closes[closes.length - 1] - position;
-            pnl += tradePnl; trades++;
-            if (tradePnl > 0) wins++;
+            const r = this.recordTrade(position, closes[closes.length - 1]);
+            out.pnl += r; out.returns.push(r); out.trades++;
+            if (r > 0) out.wins++;
         }
-        return { pnl, trades, wins };
+        return out;
     }
 
-    /**
-     * MACD crossover strategy.
-     */
     private static simulateMACD(
         klines: BinanceKline[], fastP: number, slowP: number, signalP: number
     ): SimResult {
-        if (klines.length < slowP + signalP + 1) return { pnl: 0, trades: 0, wins: 0 };
+        if (klines.length < slowP + signalP + 1) return { pnl: 0, trades: 0, wins: 0, returns: [] };
         const closes = klines.map(k => k.close);
-        let pnl = 0, trades = 0, wins = 0;
+        const out: SimResult = { pnl: 0, trades: 0, wins: 0, returns: [] };
         let position: number | null = null;
 
-        // Build MACD line
         const macdLine: number[] = [];
         for (let i = 0; i < closes.length; i++) {
             const emaFast = this.calcEMA(closes, fastP, i + 1);
             const emaSlow = this.calcEMA(closes, slowP, i + 1);
             macdLine.push(emaFast - emaSlow);
         }
-
-        // Build signal line (EMA of MACD)
         const signalLine: number[] = [];
         for (let i = 0; i < macdLine.length; i++) {
             signalLine.push(this.calcEMA(macdLine, signalP, i + 1));
         }
-
         let prevHist = macdLine[slowP] - signalLine[slowP];
 
         for (let i = slowP + 1; i < closes.length; i++) {
             const hist = macdLine[i] - signalLine[i];
             const price = closes[i];
 
-            // Crossover: histogram flips positive
             if (prevHist <= 0 && hist > 0 && position === null) {
                 position = price;
-            }
-            // Exit: histogram flips negative
-            else if (prevHist >= 0 && hist < 0 && position !== null) {
-                const tradePnl = price - position;
-                pnl += tradePnl;
-                trades++;
-                if (tradePnl > 0) wins++;
+            } else if (prevHist >= 0 && hist < 0 && position !== null) {
+                const r = this.recordTrade(position, price);
+                out.pnl += r; out.returns.push(r); out.trades++;
+                if (r > 0) out.wins++;
                 position = null;
             }
             prevHist = hist;
         }
         if (position !== null) {
-            const tradePnl = closes[closes.length - 1] - position;
-            pnl += tradePnl; trades++;
-            if (tradePnl > 0) wins++;
+            const r = this.recordTrade(position, closes[closes.length - 1]);
+            out.pnl += r; out.returns.push(r); out.trades++;
+            if (r > 0) out.wins++;
         }
-        return { pnl, trades, wins };
+        return out;
     }
 
-    /**
-     * ATR Breakout strategy.
-     */
     private static simulateBreakout(
         klines: BinanceKline[], atrMult: number, period: number
     ): SimResult {
-        if (klines.length < period + 2) return { pnl: 0, trades: 0, wins: 0 };
-        let pnl = 0, trades = 0, wins = 0;
+        if (klines.length < period + 2) return { pnl: 0, trades: 0, wins: 0, returns: [] };
+        const out: SimResult = { pnl: 0, trades: 0, wins: 0, returns: [] };
         let position: number | null = null;
 
         for (let i = period + 1; i < klines.length; i++) {
-            // ATR
             let atrSum = 0;
             for (let j = i - period; j < i; j++) {
                 const tr = Math.max(
@@ -417,19 +595,18 @@ export class WalkForwardAnalyzer {
             if (position === null && price > upper) {
                 position = price;
             } else if (position !== null && price < lower) {
-                const tradePnl = price - position;
-                pnl += tradePnl;
-                trades++;
-                if (tradePnl > 0) wins++;
+                const r = this.recordTrade(position, price);
+                out.pnl += r; out.returns.push(r); out.trades++;
+                if (r > 0) out.wins++;
                 position = null;
             }
         }
         if (position !== null) {
-            const tradePnl = klines[klines.length - 1].close - position;
-            pnl += tradePnl; trades++;
-            if (tradePnl > 0) wins++;
+            const r = this.recordTrade(position, klines[klines.length - 1].close);
+            out.pnl += r; out.returns.push(r); out.trades++;
+            if (r > 0) out.wins++;
         }
-        return { pnl, trades, wins };
+        return out;
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -463,10 +640,10 @@ export class WalkForwardAnalyzer {
     }
 
     /**
-     * Calculate plateau scores — how stable a result is relative to its neighbors.
+     * Plateau score = mean OOS PnL% of this param + its strategy-neighbors.
+     * High plateau ⇒ parameter is in a stable region (less curve-fit).
      */
     private static calculatePlateauScores(results: BacktestResult[]) {
-        // Group by strategy
         const groups = new Map<string, BacktestResult[]>();
         for (const r of results) {
             const key = r.parameterSet.strategy;
@@ -479,23 +656,37 @@ export class WalkForwardAnalyzer {
                 const current = group[i];
                 let neighborSum = current.outOfSamplePnLPercent;
                 let count = 1;
-
-                if (i > 0) {
-                    neighborSum += group[i - 1].outOfSamplePnLPercent;
-                    count++;
-                }
-                if (i < group.length - 1) {
-                    neighborSum += group[i + 1].outOfSamplePnLPercent;
-                    count++;
-                }
+                if (i > 0) { neighborSum += group[i - 1].outOfSamplePnLPercent; count++; }
+                if (i < group.length - 1) { neighborSum += group[i + 1].outOfSamplePnLPercent; count++; }
                 current.plateauScore = neighborSum / count;
             }
         }
     }
 }
 
-interface SimResult {
-    pnl: number;
-    trades: number;
-    wins: number;
+// ════════════════════════════════════════════════════════════════════════════
+// MATH HELPERS
+// ════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Sharpe ratio of a per-trade return series.  Uses 0 risk-free rate (we are
+ * judging strategies relative to each other).  Returns 0 for series with
+ * fewer than 2 trades or zero variance.
+ */
+function sharpe(returns: number[]): number {
+    if (returns.length < 2) return 0;
+    const m = returns.reduce((s, v) => s + v, 0) / returns.length;
+    const v = returns.reduce((s, x) => s + (x - m) ** 2, 0) / (returns.length - 1);
+    const sd = Math.sqrt(v);
+    if (sd === 0) return 0;
+    // Annualisation is symbol/timeframe-dependent and would mislead at this
+    // layer.  We report the **per-trade Sharpe** (mean / std), which is fully
+    // sufficient for RANKING strategies against one another.
+    return m / sd;
+}
+
+function stddev(arr: number[]): number {
+    if (arr.length < 2) return 0;
+    const m = arr.reduce((s, v) => s + v, 0) / arr.length;
+    return Math.sqrt(arr.reduce((s, x) => s + (x - m) ** 2, 0) / (arr.length - 1));
 }
