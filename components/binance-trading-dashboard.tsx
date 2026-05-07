@@ -862,17 +862,32 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
     if (!options?.silent) setIsAIConfiguring(true)
 
     try {
-      // 1. Call the Python FastAPI Microservice
-      const response = await fetch('http://127.0.0.1:8000/api/predict', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ symbol: selectedSymbol }),
-      });
+      // 1. Call the Python FastAPI Microservice (with timeout so it fails fast)
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+      let response: Response;
+      try {
+        response = await fetch('http://127.0.0.1:8000/api/predict', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ symbol: selectedSymbol }),
+          signal: controller.signal,
+        });
+      } catch (fetchError: any) {
+        clearTimeout(timeoutId);
+        // Network error or abort — the backend is not running
+        throw new Error(
+          'AI backend is not running. Start it with: python api.py'
+        );
+      }
+      clearTimeout(timeoutId);
 
       if (!response.ok) {
-        throw new Error('Failed to connect to AI Engine');
+        const errText = await response.text().catch(() => 'Unknown error');
+        throw new Error(`AI Engine returned ${response.status}: ${errText}`);
       }
 
       const data = await response.json();
@@ -926,8 +941,8 @@ export default function BinanceTradingDashboard({ initialSymbol }: DashboardProp
       console.error("AI Microservice is offline:", error);
       if (!options?.silent) {
         toast({
-          title: "AI Microservice Error",
-          description: error?.message || "Ensure your FastAPI server is running.",
+          title: "⚠️ AI Backend Offline",
+          description: error?.message || "Could not connect to the AI microservice. Run 'python api.py' in a terminal to start it.",
           variant: "destructive"
         });
       }
