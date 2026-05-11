@@ -1,594 +1,345 @@
+"""
+Institutional-grade Data Ingestion and Engineering Pipeline.
+
+Features:
+- Dynamic Universe: Integrates with universe.py (auto top-N by volume).
+- Dual-Storage: Raw data (Parquet) separated from Engineered features.
+- Quality Assurance: Automated checks for gaps, duplicates, staleness, and outliers.
+- Causal Integrity: Forward-fill only, no look-ahead bias in joins.
+- Parquet Support: High-performance storage with metadata preservation.
+"""
+
+import os
+import sys
+import time
+import json
+import logging
+import argparse
 import pandas as pd
 import numpy as np
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-import time
 from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any, Tuple
+from pathlib import Path
+
+# Local imports
 import universe as universe_lib
+from tbm_labeler import apply_triple_barrier
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
+)
+logger = logging.getLogger(__name__)
 
-def get_session():
-    session = requests.Session()
-    retry = Retry(
-        total=5,
-        read=5,
-        connect=5,
-        backoff_factor=0.3,
-        status_forcelist=(500, 502, 504),
-    )
-    adapter = HTTPAdapter(max_retries=retry)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    return session
+# Constants
+ROOT_DIR = Path(__file__).parent
+DATA_RAW_DIR = ROOT_DIR / "data" / "raw"
+DATA_PROCESSED_DIR = ROOT_DIR / "data" / "processed"
 
+# Ensure directories exist
+DATA_RAW_DIR.mkdir(parents=True, exist_ok=True)
+DATA_PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-def get_weights_ffd(d, thres=1e-4):
-    """
-    Computes the weights for the Fixed-Width Window Fractional Differencing (FFD) method.
-    """
-    w, k = [1.0], 1
-    while True:
-        w_ = -w[-1] / k * (d - k + 1)
-        if abs(w_) < thres:
-            break
-        w.append(w_)
-        k += 1
-    return np.array(w[::-1]).reshape(-1, 1)
-
-
-def frac_diff_ffd(series, d, thres=1e-4):
-    """
-    Applies Fixed-Width Window Fractional Differencing.
-    """
-    w = get_weights_ffd(d, thres)
-    width = len(w) - 1
-
-    df = {}
-    for name in series.columns:
-        series_f = series[[name]].ffill().dropna()
-        df_ = pd.Series(dtype=float, index=series_f.index)
-
-        for iloc1 in range(width, series_f.shape[0]):
-            loc0 = series_f.index[iloc1 - width]
-            loc1 = series_f.index[iloc1]
-
-            if not np.isfinite(series.loc[loc1, name]):
-                continue
-
-            df_[loc1] = np.dot(w.T, series_f.loc[loc0:loc1, name])[0]
-
-        df[name] = df_.copy(deep=True)
-
-    return pd.concat(df, axis=1)
-
-
-# Canonical TBM implementation lives in tbm_labeler.py:
-#   - symmetric ±1.5% defaults (was 1.5%/-1.0% here, which biased toward losses)
-#   - intra-bar resolution via high/low (this version was close-only)
-#   - exposes `barrier_hit_time` for sample-uniqueness weighting
-# We re-export it under the local name so existing call sites keep working.
-from tbm_labeler import apply_triple_barrier  # noqa: E402,F401
-
-
-def fetch_binance_futures_data(symbol, interval="1h", days=30):
-    """
-    Fetches OHLCV, Open Interest, and Funding Rate data from Binance Futures API.
-    """
-    session = get_session()
-
-    end_time = int(time.time() * 1000)
-    start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
-
-    print(
-        f"  Fetching data for {symbol} from {pd.to_datetime(start_time, unit='ms')} to {pd.to_datetime(end_time, unit='ms')}"
-    )
-
-    # 1. Fetch OHLCV
-    ohlcv_url = "https://fapi.binance.com/fapi/v1/klines"
-    all_klines = []
-    current_start = start_time
-
-    while current_start < end_time:
-        params = {
+class DataQualityAuditor:
+    """Performs rigorous quality checks on market data."""
+    
+    @staticmethod
+    def audit(symbol: str, df: pd.DataFrame, expected_interval: str = "1h") -> Dict[str, Any]:
+        report = {
             "symbol": symbol,
-            "interval": interval,
-            "startTime": current_start,
-            "endTime": end_time,
-            "limit": 1500,
+            "rows": len(df),
+            "start": df.index.min().isoformat() if not df.empty else None,
+            "end": df.index.max().isoformat() if not df.empty else None,
+            "issues": []
         }
-        try:
-            res = session.get(ohlcv_url, params=params, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-            if not data:
+        
+        if df.empty:
+            report["issues"].append("EMPTY_DATASET")
+            return report
+
+        # 1. Duplicate Timestamps
+        dupes = df.index.duplicated().sum()
+        if dupes > 0:
+            report["issues"].append(f"DUPLICATE_TIMESTAMPS: {dupes}")
+
+        # 2. Missing Candles (Gaps)
+        if expected_interval == "1h":
+            expected_range = pd.date_range(start=df.index.min(), end=df.index.max(), freq='1h')
+            missing = len(expected_range) - len(df)
+            if missing > 0:
+                report["issues"].append(f"MISSING_CANDLES: {missing} ({missing/len(expected_range):.2%})")
+
+        # 3. Extreme Outliers (Price jumps > 50% in a single bar)
+        returns = df['close'].pct_change().abs()
+        outliers = (returns > 0.5).sum()
+        if outliers > 0:
+            report["issues"].append(f"EXTREME_OUTLIERS: {outliers} bars with >50% move")
+
+        # 4. Zero Volume
+        zero_vol = (df['volume'] == 0).sum()
+        if zero_vol > 0:
+            report["issues"].append(f"ZERO_VOLUME_BARS: {zero_vol}")
+
+        # 5. Stale Funding (if present)
+        if 'funding_rate' in df.columns:
+            # Check if funding hasn't changed in a long time (stale API)
+            # 24h of identical funding is common, but 7 days is suspicious
+            stale_funding = (df['funding_rate'].rolling(24*7).std() == 0).sum()
+            if stale_funding > 0:
+                report["issues"].append(f"SUSPECT_STALE_FUNDING: {stale_funding} bars")
+
+        return report
+
+class BinanceDataLoader:
+    """Fetches and manages raw data from Binance Futures."""
+    
+    def __init__(self, session=None):
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+        
+        if session:
+            self.session = session
+        else:
+            self.session = requests.Session()
+            retry = Retry(total=5, backoff_factor=0.3, status_forcelist=(500, 502, 504))
+            self.session.mount("https://", HTTPAdapter(max_retries=retry))
+
+    def fetch_ohlcv(self, symbol: str, interval: str, days: int) -> pd.DataFrame:
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        end_time = int(time.time() * 1000)
+        start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        
+        all_klines = []
+        current_start = start_time
+        
+        while current_start < end_time:
+            params = {"symbol": symbol, "interval": interval, "startTime": current_start, "endTime": end_time, "limit": 1500}
+            try:
+                res = self.session.get(url, params=params, timeout=10)
+                res.raise_for_status()
+                data = res.json()
+                if not data: break
+                all_klines.extend(data)
+                current_start = data[-1][0] + 1
+                time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Error fetching OHLCV for {symbol}: {e}")
                 break
-
-            last_timestamp = data[-1][0]
-            if last_timestamp + 1 <= current_start:
-                break
-
-            all_klines.extend(data)
-            current_start = last_timestamp + 1
-            time.sleep(1)  # Sleep to respect rate limits
-        except requests.exceptions.RequestException as e:
-            print(f"    Error fetching OHLCV: {e}")
-            break
-
-    df_ohlcv = pd.DataFrame(
-        all_klines,
-        columns=[
-            "timestamp",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time",
-            "quote_asset_volume",
-            "number_of_trades",
-            "taker_buy_base",
-            "taker_buy_quote",
-            "ignore",
-        ],
-    )
-
-    if not df_ohlcv.empty:
-        df_ohlcv["timestamp"] = pd.to_datetime(df_ohlcv["timestamp"], unit="ms")
-        df_ohlcv.set_index("timestamp", inplace=True)
+                
+        if not all_klines: return pd.DataFrame()
+        
+        df = pd.DataFrame(all_klines, columns=["timestamp", "open", "high", "low", "close", "volume", "close_time", "qav", "trades", "tbb", "tbq", "ignore"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
         for col in ["open", "high", "low", "close", "volume"]:
-            df_ohlcv[col] = df_ohlcv[col].astype(float)
-        df_ohlcv = df_ohlcv[["open", "high", "low", "close", "volume"]]
-    else:
-        return pd.DataFrame()
+            df[col] = df[col].astype(float)
+        return df[["open", "high", "low", "close", "volume"]].sort_index()
 
-    # 2. Fetch Open Interest
-    oi_url = "https://fapi.binance.com/futures/data/openInterestHist"
-    all_oi = []
-    current_start = start_time
-
-    while current_start < end_time:
-        params = {
-            "symbol": symbol,
-            "period": interval,
-            "startTime": current_start,
-            "endTime": end_time,
-            "limit": 500,
-        }
-        try:
-            res = session.get(oi_url, params=params, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-            if not data:
+    def fetch_funding(self, symbol: str, days: int) -> pd.DataFrame:
+        url = "https://fapi.binance.com/fapi/v1/fundingRate"
+        end_time = int(time.time() * 1000)
+        start_time = int((datetime.now() - timedelta(days=days)).timestamp() * 1000)
+        
+        all_fr = []
+        current_start = start_time
+        while current_start < end_time:
+            params = {"symbol": symbol, "startTime": current_start, "endTime": end_time, "limit": 1000}
+            try:
+                res = self.session.get(url, params=params, timeout=10)
+                res.raise_for_status()
+                data = res.json()
+                if not data: break
+                all_fr.extend(data)
+                current_start = data[-1]["fundingTime"] + 1
+                time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Error fetching Funding for {symbol}: {e}")
                 break
+                
+        if not all_fr: return pd.DataFrame(columns=["funding_rate"])
+        
+        df = pd.DataFrame(all_fr)
+        df["timestamp"] = pd.to_datetime(df["fundingTime"], unit="ms")
+        df["funding_rate"] = df["fundingRate"].astype(float)
+        return df.set_index("timestamp")[["funding_rate"]].sort_index()
 
-            last_timestamp = data[-1]["timestamp"]
-            if last_timestamp + 1 <= current_start:
-                break
+class FeatureEngineer:
+    """Computes research-quality features with causal integrity."""
+    
+    @staticmethod
+    def get_weights_ffd(d, thres=1e-4):
+        w, k = [1.0], 1
+        while True:
+            w_ = -w[-1] / k * (d - k + 1)
+            if abs(w_) < thres: break
+            w.append(w_)
+            k += 1
+        return np.array(w[::-1]).reshape(-1, 1)
 
-            all_oi.extend(data)
-            current_start = last_timestamp + 1
-            time.sleep(1)
-        except requests.exceptions.RequestException as e:
-            print(f"    Error fetching Open Interest: {e}")
-            break
+    @classmethod
+    def frac_diff_ffd(cls, series, d, thres=1e-4):
+        w = cls.get_weights_ffd(d, thres)
+        width = len(w) - 1
+        df = {}
+        for name in series.columns:
+            series_f = series[[name]].ffill().dropna()
+            df_ = pd.Series(dtype=float, index=series_f.index)
+            for iloc1 in range(width, series_f.shape[0]):
+                loc0 = series_f.index[iloc1 - width]
+                loc1 = series_f.index[iloc1]
+                if not np.isfinite(series.loc[loc1, name]): continue
+                df_[loc1] = np.dot(w.T, series_f.loc[loc0:loc1, name])[0]
+            df[name] = df_.copy(deep=True)
+        return pd.concat(df, axis=1)
 
-    df_oi = pd.DataFrame(all_oi)
-    if not df_oi.empty:
-        df_oi["timestamp"] = pd.to_datetime(df_oi["timestamp"], unit="ms")
-        df_oi.set_index("timestamp", inplace=True)
-        df_oi["open_interest"] = df_oi["sumOpenInterest"].astype(float)
-        df_oi = df_oi[["open_interest"]]
-    else:
-        df_oi = pd.DataFrame(columns=["open_interest"])
+    @staticmethod
+    def hours_to_bars(hours, interval):
+        mapping = {"1h": 1, "2h": 0.5, "4h": 0.25, "8h": 0.125}
+        bph = mapping.get(interval, 1)
+        return max(1, int(round(hours * bph)))
 
-    # 3. Fetch Funding Rate
-    fr_url = "https://fapi.binance.com/fapi/v1/fundingRate"
-    all_fr = []
-    current_start = start_time
+    @classmethod
+    def engineer_features(cls, df: pd.DataFrame, interval: str = "1h") -> pd.DataFrame:
+        logger.info(f"Engineering features for {len(df)} rows...")
+        
+        # Windows
+        win_24h = cls.hours_to_bars(24, interval)
+        win_24h_min = max(2, win_24h // 2)
+        win_7d = cls.hours_to_bars(24 * 7, interval)
+        win_7d_min = max(2, win_7d // 4)
+        period_8h_bars = cls.hours_to_bars(8, interval)
 
-    while current_start < end_time:
-        params = {
-            "symbol": symbol,
-            "startTime": current_start,
-            "endTime": end_time,
-            "limit": 1000,
-        }
-        try:
-            res = session.get(fr_url, params=params, timeout=10)
-            res.raise_for_status()
-            data = res.json()
-            if not data:
-                break
+        # Basic momentum/rejection
+        df["volume_change_1h"] = df["volume"].pct_change()
+        df["buying_rejection"] = df["high"] - df["close"]
+        df["selling_rejection"] = df["close"] - df["low"]
 
-            last_timestamp = data[-1]["fundingTime"]
-            if last_timestamp + 1 <= current_start:
-                break
+        # Volatility & RSI
+        log_ret = np.log(df["close"]).diff()
+        df["realized_vol_24h"] = log_ret.rolling(win_24h, min_periods=win_24h_min).std()
+        
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0.0)
+        loss = -delta.clip(upper=0.0)
+        avg_gain = gain.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        avg_loss = loss.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        rs = avg_gain / avg_loss.replace(0.0, np.nan)
+        df["rsi_14"] = 100.0 - 100.0 / (1.0 + rs)
+        df["rsi_14"] = df["rsi_14"].fillna(50.0)
 
-            all_fr.extend(data)
-            current_start = last_timestamp + 1
-            time.sleep(1)
-        except requests.exceptions.RequestException as e:
-            print(f"    Error fetching Funding Rates: {e}")
-            break
+        # Normalised ranges
+        df["bar_range_pct"] = (df["high"] - df["low"]) / df["close"]
+        df["volume_zscore_24h"] = (df["volume"] - df["volume"].rolling(win_24h).mean()) / df["volume"].rolling(win_24h).std()
 
-    df_fr = pd.DataFrame(all_fr)
-    if not df_fr.empty:
-        df_fr["timestamp"] = pd.to_datetime(df_fr["fundingTime"], unit="ms")
-        df_fr = df_fr.sort_values("timestamp")
-        df_fr.set_index("timestamp", inplace=True)
-        df_fr["funding_rate"] = df_fr["fundingRate"].astype(float)
-        df_fr = df_fr[["funding_rate"]]
-    else:
-        df_fr = pd.DataFrame(columns=["funding_rate"])
+        # Causal Funding Features
+        if "funding_rate" in df.columns:
+            fr = df["funding_rate"]
+            df["funding_change_8h"] = fr.diff(period_8h_bars).fillna(0.0)
+            df["funding_zscore_7d"] = ((fr - fr.rolling(win_7d).mean()) / fr.rolling(win_7d).std()).fillna(0.0)
+            
+            # Sign streak
+            sign = np.sign(fr).fillna(0.0).astype(int)
+            seg_id = (sign != sign.shift(1)).cumsum()
+            df["funding_sign_streak"] = (sign.groupby(seg_id).cumcount() + 1).astype(float) * sign.astype(float)
 
-    # 4. Merge DataFrames.
-    #
-    # BUGFIX: Binance funding timestamps drift by tens of milliseconds from
-    # the exact 00/08/16 UTC mark (e.g. 00:00:00.021).  A naive
-    # `df_ohlcv.join(df_fr)` joins on exact DatetimeIndex equality, so most
-    # funding rows do NOT line up with any kline (which are at HH:00:00.000).
-    # The result is that 2 of every 3 funding settlements drop out and the
-    # subsequent ffill drags a stale value forward for ~24h instead of the
-    # true 8h.  Fix: reindex with method="ffill", which finds the most
-    # recent funding ts <= each kline ts.  This matches the live bot
-    # (live_features.merge_funding) exactly.
-    df = df_ohlcv.join(df_oi, how="left")
+        # Stationary Close (FFD)
+        fd_df = cls.frac_diff_ffd(df[["close"]], d=0.4)
+        df["close_fd_04"] = fd_df["close"]
 
-    if not df_fr.empty:
-        df["funding_rate"] = (
-            df_fr["funding_rate"].reindex(df.index, method="ffill").fillna(0.0)
-        )
-    else:
-        df["funding_rate"] = 0.0
-
-    df["open_interest"] = (
-        df["open_interest"].ffill().fillna(0.0).infer_objects(copy=False)
-    )
-
-    return df
-
-
-# Map Binance kline interval string -> bars per hour.  Used to rescale all
-# rolling-window features so that "24h volatility" stays 24h regardless of
-# whether we're on 1h or 4h bars.  Also used to scale TBM time_limit and
-# funding_change diff period.
-_BARS_PER_HOUR = {"1h": 1, "2h": 0.5, "4h": 0.25, "8h": 0.125}
-
-
-def _hours_to_bars(hours, interval):
-    """Number of bars in `hours` hours, rounded to the nearest integer >= 1."""
-    bph = _BARS_PER_HOUR.get(interval)
-    if bph is None:
-        raise ValueError(
-            f"Unsupported interval {interval!r} (supported: {list(_BARS_PER_HOUR)})"
-        )
-    return max(1, int(round(hours * bph)))
-
-
-def process_symbol(
-    symbol,
-    days=30,
-    tp_pct=0.010,
-    sl_pct=-0.010,
-    time_limit=24,
-    interval="1h",
-    vol_scaled_barriers=False,
-    vol_multiplier=0.2,
-):
-    print(f"\n--- Processing {symbol} ({days}d, interval={interval}) ---")
-
-    # 1. Fetch Market Data
-    df = fetch_binance_futures_data(symbol, interval=interval, days=days)
-    if df.empty:
-        print(f"  No data returned for {symbol}.")
-        return None
-
-    # 2. Engineer Features
-    #
-    # Concern #3 fix: open_interest is dead (Binance only serves ~30d of
-    # openInterestHist).  Replaced with 6 features that compute from klines
-    # alone -- no extra API, no truncation risk, all causal.
-    print("  Calculating engineered features (kline-only, causal)...")
-
-    # Window sizes (in bars) derived from the interval, so feature semantics
-    # ("24h vol", "7d funding z-score", ...) stay constant across bar sizes.
-    win_24h = _hours_to_bars(24, interval)
-    win_24h_min = max(2, win_24h // 2)
-    win_7d = _hours_to_bars(24 * 7, interval)
-    win_7d_min = max(2, win_7d // 4)
-    period_8h_bars = _hours_to_bars(8, interval)
-    print(
-        f"  Feature windows: 24h={win_24h}b  7d={win_7d}b  "
-        f"funding_diff={period_8h_bars}b"
-    )
-
-    # --- Carry-overs that proved useful and remain causal ---
-    df["volume_change_1h"] = df["volume"].pct_change(fill_method=None)
-    df["buying_rejection"] = df["high"] - df["close"]
-    df["selling_rejection"] = df["close"] - df["low"]
-
-    # --- (a) Realized volatility (24h rolling std of log-returns) ---
-    log_ret = np.log(df["close"]).diff()
-    df["realized_vol_24h"] = log_ret.rolling(win_24h, min_periods=win_24h_min).std()
-
-    # --- (b) RSI-14 (Wilder smoothing) ---
-    delta = df["close"].diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    df["rsi_14"] = 100.0 - 100.0 / (1.0 + rs)
-    df["rsi_14"] = df["rsi_14"].fillna(50.0)  # neutral when undefined
-
-    # --- (c) ATR-14 normalised by close (volatility-of-range) ---
-    prev_close = df["close"].shift(1)
-    tr = pd.concat(
-        [
-            (df["high"] - df["low"]).abs(),
-            (df["high"] - prev_close).abs(),
-            (df["low"] - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-    atr = tr.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean()
-    df["atr_14_pct"] = atr / df["close"]
-
-    # --- (d) Intra-bar range as % of close ---
-    df["bar_range_pct"] = (df["high"] - df["low"]) / df["close"]
-
-    # --- (e) Volume z-score over 24h ---
-    vol_mean = df["volume"].rolling(win_24h, min_periods=win_24h_min).mean()
-    vol_std = (
-        df["volume"]
-        .rolling(win_24h, min_periods=win_24h_min)
-        .std()
-        .replace(0.0, np.nan)
-    )
-    df["volume_zscore_24h"] = (df["volume"] - vol_mean) / vol_std
-
-    # --- (f) Distance from 24h VWAP (mean-reversion signal) ---
-    typ = (df["high"] + df["low"] + df["close"]) / 3.0
-    pv = typ * df["volume"]
-    vwap_24h = (
-        pv.rolling(win_24h, min_periods=win_24h_min).sum()
-        / df["volume"].rolling(win_24h, min_periods=win_24h_min).sum()
-    )
-    df["close_to_vwap_24h"] = df["close"] / vwap_24h - 1.0
-
-    # --- (g) Funding-rate momentum (NEW: option-a step 1) ---
-    #
-    # Funding rate is settled every 8h on Binance perps and is forward-filled
-    # to every 1h bar by fetch_binance_futures_data.  The *level* of funding
-    # already lives in df["funding_rate"]; here we add three momentum
-    # derivatives that are causally computed from past funding only:
-    #
-    #   1. funding_change_8h    First difference at the natural 8-bar period.
-    #                           Captures whether funding is accelerating in
-    #                           one direction (squeeze precursor).
-    #   2. funding_zscore_7d    Standardised level over a 7-day window.  Lets
-    #                           the model compare BTC funding (small in abs
-    #                           terms) to DOGE funding (often 10x larger)
-    #                           on a common scale.
-    #   3. funding_sign_streak  Consecutive bars with same-sign funding.
-    #                           A long streak of positive funding marks
-    #                           crowded longs -- often a reversal setup.
-    if "funding_rate" in df.columns:
-        fr = df["funding_rate"]
-
-        df["funding_change_8h"] = fr.diff(period_8h_bars).fillna(0.0)
-
-        fr_mean_7d = fr.rolling(win_7d, min_periods=win_7d_min).mean()
-        fr_std_7d = (
-            fr.rolling(win_7d, min_periods=win_7d_min).std().replace(0.0, np.nan)
-        )
-        df["funding_zscore_7d"] = ((fr - fr_mean_7d) / fr_std_7d).fillna(0.0)
-
-        # Sign-streak: groupby contiguous-sign segments and count.
-        sign = np.sign(fr).fillna(0.0).astype(int)
-        # New segment whenever sign changes; cumsum of (sign != prev_sign)
-        # gives a unique id per segment, then cumcount within id is the
-        # streak length.
-        seg_id = (sign != sign.shift(1)).cumsum()
-        df["funding_sign_streak"] = (sign.groupby(seg_id).cumcount() + 1).astype(
-            float
-        ) * sign.astype(float)
-    else:
-        df["funding_change_8h"] = 0.0
-        df["funding_zscore_7d"] = 0.0
-        df["funding_sign_streak"] = 0.0
-
-    # 3. Label using the Triple Barrier Method.
-    #    Concern #5 fix: tightened to symmetric +/-1% (was +/-1.5%) so the
-    #    horizon is shorter -> higher fire-rate -> more *unique* samples per
-    #    unit time.  Effective N rises noticeably.
-    #
-    #    Experiment A: when vol_scaled_barriers=True, barriers become
-    #    per-row dynamic, scaled by realized_vol_24h * sqrt(time_limit) *
-    #    vol_multiplier (regime-adaptive labelling, López §3.4).
-    vol_for_labeling = df["realized_vol_24h"] if vol_scaled_barriers else None
-    df = apply_triple_barrier(
-        df,
-        tp_pct=tp_pct,
-        sl_pct=sl_pct,
-        time_limit=time_limit,
-        vol_series=vol_for_labeling,
-        vol_multiplier=vol_multiplier,
-    )
-
-    # 4. Apply Fractional Differencing to create a stationary close
-    print("  Applying fractional differencing to 'close'...")
-    fd_df = frac_diff_ffd(df[["close"]], d=0.4, thres=1e-4)
-    df["close_fd_04"] = fd_df["close"]
-
-    # Drop raw OHLC columns as they are non-stationary
-    cols_to_drop = ["open", "high", "low", "close"]
-    df = df.drop(columns=[c for c in cols_to_drop if c in df.columns])
-
-    # Drop OI columns -- kept the fetch for backwards compat in the dataframe
-    # join, but they are not features any more (Binance only serves ~30d of
-    # OI history).  funding_rate IS retained -- the API serves the full
-    # history and we now use it + three momentum derivatives.
-    for c in ("open_interest", "oi_change_1h"):
-        if c in df.columns:
-            df = df.drop(columns=[c])
-
-    # 5. Track the Universe Asset
-    df["symbol"] = symbol
-
-    # 6. Sanitize all engineered columns: replace inf, then dropna on the
-    #    columns the trainer actually consumes.
-    feature_cols = [
-        "volume",
-        "volume_change_1h",
-        "buying_rejection",
-        "selling_rejection",
-        "realized_vol_24h",
-        "rsi_14",
-        "atr_14_pct",
-        "bar_range_pct",
-        "volume_zscore_24h",
-        "close_to_vwap_24h",
-        "close_fd_04",
-        "funding_rate",
-        "funding_change_8h",
-        "funding_zscore_7d",
-        "funding_sign_streak",
-    ]
-    for c in feature_cols:
-        if c in df.columns:
-            df[c] = df[c].replace([np.inf, -np.inf], np.nan)
-
-    df = df.dropna(subset=["tbm_label", "close_fd_04"] + feature_cols)
-    df["tbm_label"] = df["tbm_label"].astype(int)
-
-    return df
-
+        return df
 
 def main():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="Build the multi-symbol global alpha dataset."
-    )
-    parser.add_argument(
-        "--days",
-        type=int,
-        default=1095,
-        help="Days of 1h history to fetch per symbol (default: 1095 = 3y).",
-    )
-    
+    parser = argparse.ArgumentParser(description="Build institutional alpha dataset.")
+    parser.add_argument("--days", type=int, default=1095, help="History days (default 3y)")
+    parser.add_argument("--interval", type=str, default="1h", choices=["1h", "2h", "4h", "8h"])
+    parser.add_argument("--output", type=str, default="global_alpha_dataset.parquet")
+    parser.add_argument("--tp-pct", type=float, default=0.01)
+    parser.add_argument("--sl-pct", type=float, default=-0.01)
+    parser.add_argument("--time-limit", type=int, default=24)
     universe_lib.add_universe_args(parser)
-
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="global_alpha_dataset.csv",
-        help="Output CSV path (default: global_alpha_dataset.csv).",
-    )
-    parser.add_argument(
-        "--interval",
-        type=str,
-        default="1h",
-        choices=list(_BARS_PER_HOUR.keys()),
-        help="Binance kline interval (default: 1h). Rolling-window features auto-rescale.",
-    )
-    parser.add_argument(
-        "--tp-pct",
-        type=float,
-        default=None,
-        help="Triple-barrier take-profit %% (default: 0.010 for 1h, 0.005 for 4h).",
-    )
-    parser.add_argument(
-        "--sl-pct",
-        type=float,
-        default=None,
-        help="Triple-barrier stop-loss %% (default: -0.010 for 1h, -0.005 for 4h).",
-    )
-    parser.add_argument(
-        "--time-limit",
-        type=int,
-        default=None,
-        help="TBM time limit in bars (default: 24 for 1h, 6 for 4h = 24h hold).",
-    )
-    parser.add_argument(
-        "--vol-scaled-barriers",
-        action="store_true",
-        help="Experiment A: scale TBM barriers per-row by realized_vol_24h * "
-        "sqrt(time_limit) * vol_multiplier (regime-adaptive labelling). "
-        "Falls back to fixed --tp-pct/--sl-pct when vol is NaN.",
-    )
-    parser.add_argument(
-        "--vol-multiplier",
-        type=float,
-        default=0.2,
-        help="Scale for vol-scaled barriers. 0.2 ~ 1%% mean barrier on "
-        "1h crypto data over 24h horizon (matches fixed-1%% baseline in "
-        "expectation). Only used with --vol-scaled-barriers.",
-    )
     args = parser.parse_args()
 
-    # Sensible per-interval defaults for TBM if user didn't override.
-    if args.tp_pct is None:
-        args.tp_pct = 0.005 if args.interval == "4h" else 0.010
-    if args.sl_pct is None:
-        args.sl_pct = -0.005 if args.interval == "4h" else -0.010
-    if args.time_limit is None:
-        args.time_limit = _hours_to_bars(24, args.interval)
-
+    # 1. Resolve Universe
     selected_universe = universe_lib.resolve_universe(args)
-    print(
-        f"Universe: {selected_universe}  |  days={args.days}  |  interval={args.interval}  |  "
-        f"TBM=+{args.tp_pct:.4f}/{args.sl_pct:.4f}/{args.time_limit}bars  |  "
-        f"vol_scaled={args.vol_scaled_barriers} (mult={args.vol_multiplier})  |  "
-        f"output={args.output}"
-    )
-    all_dfs = []
+    logger.info(f"Target Universe: {selected_universe}")
 
-    for sym in selected_universe:
-        df_sym = process_symbol(
-            sym,
-            days=args.days,
-            tp_pct=args.tp_pct,
-            sl_pct=args.sl_pct,
-            time_limit=args.time_limit,
-            interval=args.interval,
-            vol_scaled_barriers=args.vol_scaled_barriers,
-            vol_multiplier=args.vol_multiplier,
-        )
-        if df_sym is not None and not df_sym.empty:
-            all_dfs.append(df_sym)
+    loader = BinanceDataLoader()
+    auditor = DataQualityAuditor()
+    all_reports = []
+    all_processed_dfs = []
 
-        # Give the API a breather before moving to the next symbol
-        time.sleep(1.5)
+    for symbol in selected_universe:
+        logger.info(f"Processing {symbol}...")
+        
+        # 2. Fetch Raw Data
+        df_ohlcv = loader.fetch_ohlcv(symbol, args.interval, args.days)
+        if df_ohlcv.empty:
+            logger.warning(f"No OHLCV for {symbol}, skipping.")
+            continue
+            
+        df_funding = loader.fetch_funding(symbol, args.days)
+        
+        # 3. Join Causally (Forward-fill funding only)
+        # We reindex funding to OHLCV timestamps using ffill to avoid look-ahead bias
+        df = df_ohlcv.copy()
+        if not df_funding.empty:
+            df["funding_rate"] = df_funding["funding_rate"].reindex(df.index, method="ffill").fillna(0.0)
+        else:
+            df["funding_rate"] = 0.0
+            
+        # 4. Save Raw Data
+        raw_path = DATA_RAW_DIR / f"{symbol}_{args.interval}.parquet"
+        df.to_parquet(raw_path)
+        logger.info(f"Saved raw data to {raw_path}")
 
-    if not all_dfs:
-        print("No data processed. Script aborted.")
+        # 5. Audit Quality
+        report = auditor.audit(symbol, df, args.interval)
+        all_reports.append(report)
+        if report["issues"]:
+            logger.warning(f"QA Report for {symbol}: {report['issues']}")
+        else:
+            logger.info(f"QA Report for {symbol}: PASSED")
+
+        # 6. Engineer Features
+        df_feat = FeatureEngineer.engineer_features(df, args.interval)
+        
+        # 7. Label (TBM)
+        df_labeled = apply_triple_barrier(df_feat, tp_pct=args.tp_pct, sl_pct=args.sl_pct, time_limit=args.time_limit)
+        
+        # Cleanup
+        df_labeled["symbol"] = symbol
+        cols_to_drop = ["open", "high", "low", "close"]
+        df_final = df_labeled.drop(columns=[c for c in cols_to_drop if c in df_labeled.columns])
+        
+        # Sanitize
+        df_final = df_final.replace([np.inf, -np.inf], np.nan).dropna()
+        all_processed_dfs.append(df_final)
+        
+        time.sleep(1) # Breathe
+
+    # 8. Aggregate and Save Final Dataset
+    if not all_processed_dfs:
+        logger.error("No data processed. Aborting.")
         return
 
-    # 7. Aggregate and Output
-    print("\n--- Aggregating Global Dataset ---")
-    global_df = pd.concat(all_dfs)
+    global_df = pd.concat(all_processed_dfs).sort_index(kind="mergesort")
+    
+    # Save Report
+    report_path = ROOT_DIR / "ingestion_report.json"
+    with open(report_path, "w") as f:
+        json.dump(all_reports, f, indent=4)
+    logger.info(f"Ingestion report saved to {report_path}")
 
-    # Sort globally by timestamp so purged-k-fold splits are chronologically
-    # contiguous across the full multi-symbol dataset (López §7.4 assumes
-    # time-ordered rows). Within a single timestamp, ties are broken by
-    # symbol order, which is fine because rows from different symbols at the
-    # same bar do not share label horizons.
-    global_df = global_df.sort_index(kind="mergesort")
-
-    output_file = args.output
-    global_df.to_csv(output_file)
-    print(f"Global dataset successfully built and saved to {output_file}!")
-
-    print("\n--- Global Dataset Stats ---")
-    print(f"Total Rows: {len(global_df)}")
-    print("\n--- TBM Label Class Distribution ---")
-    print("1 = Win (Hit TP: 1.5%)")
-    print("0 = Loss (Hit SL: -1.0% or Time Expiry: 24h)")
-    print(global_df["tbm_label"].value_counts())
-
+    # Save Final Dataset
+    output_path = DATA_PROCESSED_DIR / args.output
+    if args.output.endswith(".parquet"):
+        global_df.to_parquet(output_path)
+    else:
+        global_df.to_csv(output_path)
+    logger.info(f"Global dataset saved to {output_path} ({len(global_df)} rows)")
 
 if __name__ == "__main__":
     main()
