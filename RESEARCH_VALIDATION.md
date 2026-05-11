@@ -4,18 +4,22 @@
 This report details the rolling walk-forward validation of the AI Trading Bot. We evaluate out-of-sample performance through an **ablation study**, systematically adding layers of institutional realism to isolate the impact of each component (Fractional Differencing, Triple Barrier Method, Microstructure Features, Calibration, and Realistic Risk Filters).
 
 ## 🔬 1. Ablation Study
-Adding complexity only makes sense if it improves metrics. We track Accuracy, F1 Score, and Expected PnL as we move from a simple baseline to the full institutional pipeline.
+Adding complexity only makes sense if it improves metrics. We track Accuracy, F1 Score, and Expected PnL as we move from a simple baseline to the full institutional pipeline. The chart separates economics from classification scores because accuracy near 50% is not sufficient if expected PnL remains negative after friction.
 
-![Ablation Study](ablation_study.png)
+### Expected PnL After Friction
+![Ablation Expected PnL](ablation_pnl.png)
+
+### Classification Metrics
+![Ablation Classification Metrics](ablation_classification.png)
 
 | Configuration | Accuracy | F1 Score | Brier | Trades | Win Rate | Exp. PnL |
 |---|---|---|---|---|---|---|
-| 1 Baseline | 0.5167 | 0.5259 | 0.2631 | 6588 | 51.46% | -0.0027% |
-| 2 Plus FFD | 0.5034 | 0.5690 | 0.2816 | 8266 | 50.15% | -0.1282% |
-| 3 Plus TBM | 0.4959 | 0.5064 | 0.2777 | 6924 | 47.23% | -0.1109% |
-| 4 Plus Funding | 0.5112 | 0.5075 | 0.2776 | 6561 | 48.54% | -0.0582% |
-| 5 Plus Calibration | 0.5052 | 0.5224 | 0.3379 | 7113 | 48.12% | -0.0751% |
-| 6 Plus Risk Filters | 0.5052 | 0.5224 | 0.3379 | 7113 | 48.12% | -0.1651% |
+| 1 Baseline | 0.5034 | 0.5041 | 0.2642 | 6672 | 47.84% | -0.1763% |
+| 2 Plus FFD | 0.4929 | 0.5439 | 0.2796 | 8066 | 47.40% | -0.1941% |
+| 3 Plus TBM | 0.4977 | 0.5068 | 0.2770 | 6887 | 47.39% | -0.1943% |
+| 4 Plus Funding | 0.5035 | 0.5103 | 0.2815 | 6830 | 47.91% | -0.1737% |
+| 5 Plus Calibration | 0.5044 | 0.5310 | 0.3452 | 7371 | 48.13% | -0.1646% |
+| 6 Plus Risk Filters | 0.5045 | 0.5091 | 0.3452 | 6771 | 47.98% | -0.1706% |
 
 ## 📊 2. Performance Visualization
 ### Cumulative Equity Curve (Out-of-Sample)
@@ -38,11 +42,11 @@ A look at the raw classification performance for the final pipeline. We prioriti
 ### Top 5 Maximum Drawdowns
 | Start Date | End Date | Max Drawdown (%) |
 |---|---|---|
-| 2026-01-14 14:00:00 | 2026-05-09 20:00:00 | -100.00% |
-| 2025-11-15 07:00:00 | 2026-01-05 09:00:00 | -99.78% |
-| 2026-01-06 13:00:00 | 2026-01-11 07:00:00 | -72.05% |
-| 2026-01-12 02:00:00 | 2026-01-12 12:00:00 | -19.40% |
-| 2026-01-12 17:00:00 | 2026-01-12 20:00:00 | -4.35% |
+| 2026-01-14 14:00:00 | 2026-05-09 21:00:00 | -100.00% |
+| 2025-11-23 15:00:00 | 2026-01-04 23:00:00 | -99.67% |
+| 2025-11-16 02:00:00 | 2025-11-23 14:00:00 | -69.09% |
+| 2026-01-06 14:00:00 | 2026-01-10 21:00:00 | -64.19% |
+| 2026-01-12 02:00:00 | 2026-01-12 13:00:00 | -20.91% |
 
 ## ⚠️ 4. Methodology & Limitations
 - **Data Integrity:** Walk-forward validation was performed over a 1-year historical window (~8,760 hours). All features were computed causally to prevent look-ahead bias.

@@ -78,9 +78,10 @@ def create_visualizations(results, taken_trades, dd_table):
     
     # 1. Equity Curve
     plt.figure(figsize=(12, 6))
-    plt.plot(taken_trades["timestamp"], taken_trades["equity"], label="Account Equity", color="#2ecc71", linewidth=2)
-    plt.fill_between(taken_trades["timestamp"], 10000, taken_trades["equity"], where=(taken_trades["equity"] >= 10000), color="#2ecc71", alpha=0.3)
-    plt.fill_between(taken_trades["timestamp"], 10000, taken_trades["equity"], where=(taken_trades["equity"] < 10000), color="#e74c3c", alpha=0.3)
+    if not taken_trades.empty:
+        plt.plot(taken_trades["timestamp"], taken_trades["equity"], label="Account Equity", color="#2ecc71", linewidth=2)
+        plt.fill_between(taken_trades["timestamp"], 10000, taken_trades["equity"], where=(taken_trades["equity"] >= 10000), color="#2ecc71", alpha=0.3)
+        plt.fill_between(taken_trades["timestamp"], 10000, taken_trades["equity"], where=(taken_trades["equity"] < 10000), color="#e74c3c", alpha=0.3)
     plt.axhline(y=10000, color='black', linestyle='--', alpha=0.5)
     plt.title("Out-of-Sample Cumulative Performance (Full Pipeline)", fontsize=14, fontweight='bold')
     plt.xlabel("Timeline", fontsize=12)
@@ -92,8 +93,9 @@ def create_visualizations(results, taken_trades, dd_table):
 
     # 2. Drawdown Plot
     plt.figure(figsize=(12, 4))
-    dd_series = (taken_trades["equity"] - taken_trades["equity"].expanding().max()) / taken_trades["equity"].expanding().max() * 100
-    plt.fill_between(taken_trades["timestamp"], 0, dd_series, color="#e74c3c", alpha=0.6)
+    if not taken_trades.empty:
+        dd_series = (taken_trades["equity"] - taken_trades["equity"].expanding().max()) / taken_trades["equity"].expanding().max() * 100
+        plt.fill_between(taken_trades["timestamp"], 0, dd_series, color="#e74c3c", alpha=0.6)
     plt.title("Portfolio Drawdown Profile (%)", fontsize=14, fontweight='bold')
     plt.ylabel("Drawdown %", fontsize=12)
     plt.ylim(None, 0)
@@ -102,34 +104,127 @@ def create_visualizations(results, taken_trades, dd_table):
     plt.close()
 
     # 3. Ablation Study Comparison
+    #
+    # Keep financial and classification metrics on separate panels.  The
+    # previous dual-axis chart mixed negative expected PnL bars with a
+    # compressed accuracy line, which made the ablation look visually better
+    # than the economics actually were.  For a research paper, the first read
+    # should be: "all configurations are still negative after friction."
     ablation_data = []
-    for conf, m in results.items():
-        ablation_data.append({
-            "Config": conf.replace("_", " "),
-            "Accuracy": m["Accuracy"],
-            "F1 Score": m["F1"],
-            "Exp PnL": m["Expected PnL/Trade"] * 100 # Convert to %
-        })
+    # Ensure correct order
+    order = ["1_Baseline", "2_Plus_FFD", "3_Plus_TBM", "4_Plus_Funding", "5_Plus_Calibration", "6_Plus_Risk_Filters"]
+    for conf in order:
+        if conf in results:
+            m = results[conf]
+            ablation_data.append({
+                "Config": conf.replace("_", " "),
+                "Accuracy": m["Accuracy"],
+                "F1 Score": m["F1"],
+                "Exp PnL": m["Expected PnL/Trade"] * 100 # Convert to %
+            })
     ablation_df = pd.DataFrame(ablation_data)
 
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    
-    # Bar for PnL
-    sns.barplot(data=ablation_df, x="Config", y="Exp PnL", hue="Config", ax=ax1, palette="viridis", alpha=0.7, legend=False)
-    ax1.set_ylabel("Expected PnL per Trade (%)", fontsize=12, fontweight='bold')
-    ax1.set_xlabel("Pipeline Configuration", fontsize=12)
-    plt.xticks(rotation=15)
-    
-    # Line for Accuracy
-    ax2 = ax1.twinx()
-    sns.lineplot(data=ablation_df, x="Config", y="Accuracy", ax=ax2, color="#e67e22", marker="o", linewidth=3, label="Accuracy")
-    ax2.set_ylabel("Metric Score", fontsize=12, fontweight='bold')
-    ax2.set_ylim(0.4, 0.6)
-    
-    plt.title("Ablation Study: Impact of Institutional Layers", fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig("ablation_study.png", dpi=150)
-    plt.close()
+    fig, ax_pnl = plt.subplots(figsize=(11, 6.2))
+    colors = ["#d95f5f" if v < 0 else "#2ca25f" for v in ablation_df["Exp PnL"]]
+    bars = ax_pnl.barh(
+        ablation_df["Config"],
+        ablation_df["Exp PnL"],
+        color=colors,
+        alpha=0.86,
+        edgecolor="#333333",
+        linewidth=0.7,
+    )
+    ax_pnl.axvline(0, color="#222222", linewidth=1.2)
+    ax_pnl.set_xlabel("Expected PnL / Trade (%)", fontsize=11, fontweight="bold")
+    ax_pnl.set_ylabel("Pipeline Configuration", fontsize=11, fontweight="bold")
+    ax_pnl.set_title(
+        "Ablation Study: Expected PnL After Friction\n"
+        "All configurations include 9 bps friction; bars left of zero lose money per acted trade",
+        fontsize=14,
+        fontweight="bold",
+    )
+    ax_pnl.grid(axis="x", alpha=0.35)
+
+    y_min = min(ablation_df["Exp PnL"].min() * 1.25, -0.02)
+    y_max = max(ablation_df["Exp PnL"].max() * 0.25, 0.02)
+    ax_pnl.set_xlim(y_min, y_max)
+    for bar, value in zip(bars, ablation_df["Exp PnL"]):
+        ax_pnl.annotate(
+            f"{value:+.3f}%",
+            xy=(value, bar.get_y() + bar.get_height() / 2),
+            xytext=(-8 if value < 0 else 8, 0),
+            textcoords="offset points",
+            ha="right" if value < 0 else "left",
+            va="center",
+            fontsize=9,
+            fontweight="bold",
+            color="#222222",
+        )
+
+    best_idx = ablation_df["Exp PnL"].idxmax()
+    worst_idx = ablation_df["Exp PnL"].idxmin()
+    ax_pnl.annotate(
+        "Least negative",
+        xy=(ablation_df.loc[best_idx, "Exp PnL"], best_idx),
+        xytext=(y_max * 0.75, best_idx),
+        arrowprops={"arrowstyle": "->", "color": "#2ca25f"},
+        ha="left",
+        va="center",
+        fontsize=9,
+        color="#2ca25f",
+        fontweight="bold",
+    )
+    ax_pnl.annotate(
+        "Worst",
+        xy=(ablation_df.loc[worst_idx, "Exp PnL"], worst_idx),
+        xytext=(y_min * 0.92, worst_idx),
+        arrowprops={"arrowstyle": "->", "color": "#b2182b"},
+        ha="right",
+        va="center",
+        fontsize=9,
+        color="#b2182b",
+        fontweight="bold",
+    )
+    ax_pnl.invert_yaxis()
+    fig.tight_layout()
+    fig.savefig("ablation_pnl.png", dpi=170, bbox_inches="tight")
+    plt.close(fig)
+
+    fig, ax_cls = plt.subplots(figsize=(12, 5.2))
+    x_coords = np.arange(len(ablation_df))
+    ax_cls.plot(
+        x_coords,
+        ablation_df["Accuracy"],
+        color="#1f77b4",
+        marker="o",
+        linewidth=2.4,
+        label="Accuracy",
+    )
+    ax_cls.plot(
+        x_coords,
+        ablation_df["F1 Score"],
+        color="#ff7f0e",
+        marker="s",
+        linewidth=2.4,
+        label="F1 Score",
+    )
+    ax_cls.axhline(0.50, color="#777777", linestyle="--", linewidth=1, alpha=0.8)
+    ax_cls.set_ylabel("Score", fontsize=11, fontweight="bold")
+    ax_cls.set_xlabel("Pipeline Configuration", fontsize=11, fontweight="bold")
+    ax_cls.set_ylim(0.45, 0.58)
+    ax_cls.set_xticks(x_coords)
+    ax_cls.set_xticklabels(ablation_df["Config"], rotation=15, ha="right")
+    ax_cls.grid(axis="y", alpha=0.35)
+    ax_cls.legend(loc="upper right", frameon=True)
+
+    ax_cls.set_title(
+        "Ablation Study: Classification Metrics",
+        fontsize=14,
+        fontweight="bold",
+    )
+    fig.tight_layout()
+    fig.savefig("ablation_classification.png", dpi=170, bbox_inches="tight")
+    plt.close(fig)
 
     # 4. Confusion Matrix Heatmap
     plt.figure(figsize=(8, 6))
@@ -194,14 +289,15 @@ def run_ablation_study(df):
         pnl_all = []
         
         for train_df, test_df in folds:
-            # Embargo: drop last 24 rows from train to avoid leakage
+            # Embargo
             train_df = train_df.iloc[:-24]
             
             X_train = train_df[feats]
             y_train = train_df[label_col].astype(int)
             
             X_test = test_df[feats]
-            y_test = test_df[label_col].astype(int)
+            # ALWAYS evaluate against tbm_label for consistent metric comparison
+            y_test = test_df["tbm_label"].astype(int)
             
             model = xgb.XGBClassifier(n_estimators=50, max_depth=4, random_state=42, n_jobs=-1)
             model.fit(X_train, y_train)
@@ -213,31 +309,32 @@ def run_ablation_study(df):
             else:
                 y_proba = model.predict_proba(X_test)[:, 1]
                 
-            y_pred = (y_proba >= 0.5).astype(int)
+            # Config 6 uses a tighter threshold as a "Risk Filter"
+            threshold = 0.55 if conf.get("risk_filters") else 0.5
+            y_pred = (y_proba >= threshold).astype(int)
             
             y_true_all.extend(y_test.values)
             y_pred_all.extend(y_pred)
             y_proba_all.extend(y_proba)
             
-            # PnL Calculation
-            test_returns = test_df["fixed_24h_return"].values if label_col == "fixed_24h_label" else test_df["tbm_return"].values
+            # ALWAYS use tbm_return for PnL benchmark to ensure apples-to-apples
+            test_returns = test_df["tbm_return"].values
             
             for i in range(len(y_pred)):
                 if y_pred[i] == 1:
+                    # Apply friction to ALL configs to show realistic institutional edge
                     gross_ret = test_returns[i]
-                    if conf.get("risk_filters"):
-                        net_ret = gross_ret - 0.0009
-                        pnl_all.append(net_ret)
-                        if conf_name == "6_Plus_Risk_Filters":
-                            all_preds_config6.append({
-                                "timestamp": test_df.index[i],
-                                "symbol": test_df["symbol"].iloc[i],
-                                "proba": y_proba[i],
-                                "label": y_test.iloc[i],
-                                "net_return": net_ret
-                            })
-                    else:
-                        pnl_all.append(gross_ret)
+                    net_ret = gross_ret - 0.0009
+                    pnl_all.append(net_ret)
+                    
+                    if conf_name == "6_Plus_Risk_Filters":
+                        all_preds_config6.append({
+                            "timestamp": test_df.index[i],
+                            "symbol": test_df["symbol"].iloc[i],
+                            "proba": y_proba[i],
+                            "label": y_test.iloc[i],
+                            "net_return": net_ret
+                        })
                 else:
                     pnl_all.append(0.0)
 
@@ -252,8 +349,9 @@ def run_ablation_study(df):
         cm = confusion_matrix(y_t, y_p).tolist()
         
         trades = np.sum(y_p)
-        wr = np.sum(pnl > 0) / trades if trades > 0 else 0.0
+        # Expected PnL per trade when the model says "BUY"
         exp_pnl = np.mean(pnl[y_p == 1]) if trades > 0 else 0.0
+        wr = np.sum(pnl[y_p == 1] > 0) / trades if trades > 0 else 0.0
         
         results[conf_name] = {
             "Accuracy": acc,
@@ -267,14 +365,18 @@ def run_ablation_study(df):
         
     return results, pd.DataFrame(all_preds_config6)
 
+
 def generate_markdown(results, dd_table):
     md = "# 🛡️ Institutional Research Validation Report\n\n"
     md += "## 📈 Executive Summary\n"
     md += "This report details the rolling walk-forward validation of the AI Trading Bot. We evaluate out-of-sample performance through an **ablation study**, systematically adding layers of institutional realism to isolate the impact of each component (Fractional Differencing, Triple Barrier Method, Microstructure Features, Calibration, and Realistic Risk Filters).\n\n"
     
     md += "## 🔬 1. Ablation Study\n"
-    md += "Adding complexity only makes sense if it improves metrics. We track Accuracy, F1 Score, and Expected PnL as we move from a simple baseline to the full institutional pipeline.\n\n"
-    md += "![Ablation Study](ablation_study.png)\n\n"
+    md += "Adding complexity only makes sense if it improves metrics. We track Accuracy, F1 Score, and Expected PnL as we move from a simple baseline to the full institutional pipeline. The chart separates economics from classification scores because accuracy near 50% is not sufficient if expected PnL remains negative after friction.\n\n"
+    md += "### Expected PnL After Friction\n"
+    md += "![Ablation Expected PnL](ablation_pnl.png)\n\n"
+    md += "### Classification Metrics\n"
+    md += "![Ablation Classification Metrics](ablation_classification.png)\n\n"
     
     md += "| Configuration | Accuracy | F1 Score | Brier | Trades | Win Rate | Exp. PnL |\n"
     md += "|---|---|---|---|---|---|---|\n"
