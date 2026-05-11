@@ -102,15 +102,16 @@ CALIBRATOR_SAVE_PATH = "tbm_xgboost_model_v2_calibrated.pkl"
 THRESHOLD_SAVE_PATH = "tbm_xgboost_model_v2_threshold.json"
 EMBARGO_FRACTION = 0.01  # 1% embargo gap to prevent label-leakage between train/val
 
-
 def load_and_prepare_data(data_file: str = DATA_FILE):
     """
     Loads the fractionally differenced dataset and prepares it for time-series training.
-    Returns (X, y, barrier_hit_time-or-None) so callers can decide whether to use
-    sample-uniqueness weighting and purged k-fold CV.
+    Supports both CSV and Parquet formats.
     """
     print(f"Loading data from {data_file}...")
-    df = pd.read_csv(data_file)
+    if data_file.endswith(".parquet"):
+        df = pd.read_parquet(data_file)
+    else:
+        df = pd.read_csv(data_file)
 
     # Capture barrier_hit_time BEFORE dropping it — it is needed downstream
     # for sample uniqueness weights and purged k-fold splits.
@@ -129,15 +130,12 @@ def load_and_prepare_data(data_file: str = DATA_FILE):
     X = df.drop(columns=[TARGET_COL])
     y = df[TARGET_COL].astype(int)
 
-    print(f"Features used for training: {list(X.columns)}")
-
-    # Verify 'close' is gone and 'close_fd_04' is present
+    # Explicitly drop 'close' if it leaked in
     if "close" in X.columns:
-        print("WARNING: 'close' column found in features. Dropping it.")
+        print("Dropping 'close' from features.")
         X = X.drop(columns=["close"])
-    if "close_fd_04" not in X.columns:
-        print("WARNING: 'close_fd_04' column NOT found in features.")
 
+    print(f"Features used for training ({len(X.columns)}): {list(X.columns)}")
     return X, y, bht
 
 

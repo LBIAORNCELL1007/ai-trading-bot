@@ -230,6 +230,22 @@ class FeatureEngineer:
         df["rsi_14"] = 100.0 - 100.0 / (1.0 + rs)
         df["rsi_14"] = df["rsi_14"].fillna(50.0)
 
+        # ATR & VWAP
+        prev_close = df["close"].shift(1)
+        tr = pd.concat([
+            (df["high"] - df["low"]).abs(),
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+        df["atr_14_pct"] = atr / df["close"]
+
+        typ = (df["high"] + df["low"] + df["close"]) / 3.0
+        pv = typ * df["volume"]
+        vwap_24h = (pv.rolling(win_24h, min_periods=win_24h_min).sum() / 
+                    df["volume"].rolling(win_24h, min_periods=win_24h_min).sum())
+        df["close_to_vwap_24h"] = df["close"] / vwap_24h - 1.0
+
         # Normalised ranges
         df["bar_range_pct"] = (df["high"] - df["low"]) / df["close"]
         df["volume_zscore_24h"] = (df["volume"] - df["volume"].rolling(win_24h).mean()) / df["volume"].rolling(win_24h).std()
