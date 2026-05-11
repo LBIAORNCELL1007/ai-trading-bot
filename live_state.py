@@ -71,6 +71,14 @@ def init_db(db_path: Path = DB_PATH_DEFAULT) -> None:
             CREATE INDEX IF NOT EXISTS ix_positions_open
                 ON positions(symbol, closed_at);
 
+            CREATE TABLE IF NOT EXISTS risk_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                paper_equity REAL NOT NULL,
+                peak_equity REAL NOT NULL,
+                daily_start_equity REAL NOT NULL,
+                last_trade_date TEXT NOT NULL
+            );
+            
             CREATE TABLE IF NOT EXISTS events (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 created_at  TEXT NOT NULL,
@@ -254,6 +262,28 @@ def has_open_position(symbol: str, db_path: Path = DB_PATH_DEFAULT) -> bool:
 def count_open_positions(db_path: Path = DB_PATH_DEFAULT) -> int:
     return len(list_open_positions(db_path=db_path))
 
+# ─────────────────────────── Risk State ────────────────────────────────────
+
+def get_risk_state(db_path: Path = DB_PATH_DEFAULT) -> Optional[dict[str, Any]]:
+    with get_conn(db_path) as cx:
+        row = cx.execute("SELECT * FROM risk_state WHERE id=1").fetchone()
+        return dict(row) if row else None
+
+def insert_risk_state(state_dict: dict[str, Any], db_path: Path = DB_PATH_DEFAULT) -> None:
+    with get_conn(db_path) as cx:
+        cx.execute(
+            "INSERT INTO risk_state (id, paper_equity, peak_equity, daily_start_equity, last_trade_date) "
+            "VALUES (1, :paper_equity, :peak_equity, :daily_start_equity, :last_trade_date)",
+            state_dict,
+        )
+
+def update_risk_state(updates: dict[str, Any], db_path: Path = DB_PATH_DEFAULT) -> None:
+    if not updates:
+        return
+    set_clause = ", ".join(f"{k}=:{k}" for k in updates.keys())
+    updates["id"] = 1
+    with get_conn(db_path) as cx:
+        cx.execute(f"UPDATE risk_state SET {set_clause} WHERE id=:id", updates)
 
 if __name__ == "__main__":
     # Smoke test.

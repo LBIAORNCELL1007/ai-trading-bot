@@ -45,6 +45,7 @@ import numpy as np
 import pandas as pd
 import xgboost as xgb
 import universe as universe_lib
+from risk_manager import RiskManager, RiskConfig
 
 # Pickle resolution for calibrator class
 try:
@@ -134,7 +135,6 @@ def parse_args() -> tuple[BotConfig, bool]:
     p.add_argument("--max-hold-hours", type=int, default=48)
     p.add_argument("--poll-sec", type=float, default=60.0)
     p.add_argument("--fill-timeout", type=float, default=60.0)
-    p.add_argument("--max-spread", type=float, default=0.1, help="Max spread %% gate")
     p.add_argument(
         "--funding-min",
         type=float,
@@ -409,6 +409,7 @@ def evaluate_symbol(
     bundle: ModelBundle,
     cfg: BotConfig,
     client: Optional["UMFutures"],
+    risk_mgr: RiskManager,
 ) -> None:
     sym = ctx.symbol
     bar_close = latest_closed_bar_time(datetime.now(timezone.utc), cfg.interval)
@@ -524,8 +525,21 @@ def evaluate_symbol(
         best_bid, best_ask = last_close, last_close
     print(f"  [{sym}] bid={best_bid}  ask={best_ask}")
 
-    # 5. Quantity sizing
-    qty = cfg.risk_per_trade_usdt / max(best_ask, 1e-12)
+    # 5. Quantity sizing (Risk Manager)
+    risk_result = risk_mgr.check_pre_trade_gates(
+        symbol=sym,
+        price=best_ask,
+        win_rate=cal,
+        tp_pct=cfg.tp_pct,
+        sl_pct=cfg.sl_pct
+    )
+    if not risk_result["passed"]:
+        print(f"  [{sym}] risk gate failed: {risk_result['reason']}")
+        state.update_intent_outcome(intent_id, "skipped", note=risk_result['reason'])
+        ctx.last_evaluated_bar = bar_close
+        return
+    qty = risk_result["qty"]
+    print(f"  [{sym}] Risk check passed. Equity: ${risk_result['equity']:.2f}, Risk: ${risk_result['risk_usdt']:.2f}, Qty: {qty:.4f}")
 
     # 6. Place maker buy
     fill = lo.place_maker_buy(
@@ -549,6 +563,10 @@ def evaluate_symbol(
         )
         ctx.last_evaluated_bar = bar_close
         return
+
+    # In paper mode, deduct entry fee from equity
+    if cfg.paper and fill.fee_paid > 0:
+        risk_mgr.update_paper_equity(0.0, fee_paid=fill.fee_paid)
 
     entry = fill.avg_price or best_bid
     tp_price = entry * (1.0 + cfg.tp_pct)
@@ -614,6 +632,7 @@ def monitor_positions(
     cfg: BotConfig,
     client: Optional["UMFutures"],
     filters_by_symbol: dict[str, lo.SymbolFilters],
+    risk_mgr: RiskManager,
 ) -> None:
     """Check open positions for TP/SL fills (real mode) or barrier hits (paper)."""
     open_pos = state.list_open_positions()
@@ -655,6 +674,12 @@ def monitor_positions(
                 if close_reason:
                     pnl = (close_price - p["entry_price"]) / p["entry_price"]
                     state.close_position(p["id"], close_price, close_reason, pnl)
+                    
+                    # Update paper equity
+                    pnl_usdt = p["quantity"] * (close_price - p["entry_price"])
+                    fee_paid = p["quantity"] * close_price * 0.0004 # default 4bp taker fee
+                    risk_mgr.update_paper_equity(pnl_usdt, fee_paid=fee_paid)
+
                     state.log_event(
                         "position_closed",
                         symbol=sym,
@@ -663,11 +688,13 @@ def monitor_positions(
                             "reason": close_reason,
                             "close_price": close_price,
                             "pnl_pct": pnl,
+                            "pnl_usdt": pnl_usdt,
+                            "fee_paid": fee_paid
                         },
                     )
                     print(
                         f"  [{sym}] CLOSED ({close_reason}) close={close_price:.6f} "
-                        f"pnl={pnl * 100:+.3f}%  pos_id={p['id']}"
+                        f"pnl={pnl * 100:+.3f}% (${pnl_usdt:.2f}) pos_id={p['id']}"
                     )
             except Exception as e:
                 print(f"  [{sym}] paper-monitor error: {e}")
@@ -799,6 +826,13 @@ def main() -> int:
     filters_by_symbol: dict[str, lo.SymbolFilters] = {}
     contexts: list[SymbolCtx] = []
 
+    risk_mgr = RiskManager(client, cfg.paper)
+    rs = risk_mgr.sync_risk_state()
+    if not rs:
+        print("[FATAL] Could not initialize risk state. Exiting.")
+        return 2
+    print(f"Risk State Initialized: Equity=${rs.get('paper_equity', 0):.2f}, Peak=${rs.get('peak_equity', 0):.2f}")
+
     if cfg.paper:
         try:
             r = _session.get(f"{PUBLIC_DATA_BASE}/fapi/v1/exchangeInfo", timeout=15)
@@ -862,8 +896,8 @@ def main() -> int:
         iteration += 1
         try:
             for ctx in contexts:
-                evaluate_symbol(ctx, bundle, cfg, client)
-            monitor_positions(bundle, cfg, client, filters_by_symbol)
+                evaluate_symbol(ctx, bundle, cfg, client, risk_mgr)
+            monitor_positions(bundle, cfg, client, filters_by_symbol, risk_mgr)
         except KeyboardInterrupt:
             break
         except Exception as e:
