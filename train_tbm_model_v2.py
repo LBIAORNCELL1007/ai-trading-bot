@@ -83,7 +83,20 @@ TARGET_COL = "tbm_label"
 #                      effects are already captured by the z-scored
 #                      volume/OI/funding columns, so dropping it lets one
 #                      model learn the cross-asset structure cleanly)
-DROP_COLS = ["timestamp", "target_return_4h", "barrier_hit_time", "close_fd", "symbol"]
+#   bar_range_pct     (REMOVED 2026-05 after leave-one-out ablation: dropping
+#                      this feature improved global WR by +2.7pp and SOL WR
+#                      by +3.0pp.  Highly correlated with realized_vol_24h /
+#                      atr_14_pct so it added noise without information.
+#                      Still computed in build_global_dataset.py for dataset
+#                      stability, but excluded at training time.)
+DROP_COLS = [
+    "timestamp",
+    "target_return_4h",
+    "barrier_hit_time",
+    "close_fd",
+    "symbol",
+    "bar_range_pct",
+]
 MODEL_SAVE_PATH = "tbm_xgboost_model_v2.json"
 CALIBRATOR_SAVE_PATH = "tbm_xgboost_model_v2_calibrated.pkl"
 THRESHOLD_SAVE_PATH = "tbm_xgboost_model_v2_threshold.json"
