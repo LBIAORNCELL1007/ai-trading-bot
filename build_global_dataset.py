@@ -5,6 +5,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import time
 from datetime import datetime, timedelta
+import universe as universe_lib
 
 
 def get_session():
@@ -463,12 +464,9 @@ def main():
         default=1095,
         help="Days of 1h history to fetch per symbol (default: 1095 = 3y).",
     )
-    parser.add_argument(
-        "--symbols",
-        type=str,
-        default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,DOGEUSDT,MATICUSDT",
-        help="Comma-separated list of perp symbols (default: 10 majors).",
-    )
+    
+    universe_lib.add_universe_args(parser)
+
     parser.add_argument(
         "--output",
         type=str,
@@ -510,15 +508,15 @@ def main():
     if args.time_limit is None:
         args.time_limit = _hours_to_bars(24, args.interval)
 
-    universe = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    selected_universe = universe_lib.resolve_universe(args)
     print(
-        f"Universe: {universe}  |  days={args.days}  |  interval={args.interval}  |  "
+        f"Universe: {selected_universe}  |  days={args.days}  |  interval={args.interval}  |  "
         f"TBM=+{args.tp_pct:.4f}/{args.sl_pct:.4f}/{args.time_limit}bars  |  "
         f"output={args.output}"
     )
     all_dfs = []
 
-    for sym in universe:
+    for sym in selected_universe:
         df_sym = process_symbol(
             sym,
             days=args.days,

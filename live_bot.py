@@ -44,6 +44,7 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import xgboost as xgb
+import universe as universe_lib
 
 # Pickle resolution for calibrator class
 try:
@@ -104,9 +105,11 @@ class BotConfig:
     poll_interval_sec: float = 60.0  # main loop cadence
 
 
-def parse_args() -> BotConfig:
+def parse_args() -> tuple[BotConfig, bool]:
     p = argparse.ArgumentParser()
-    p.add_argument("--symbols", default="BTCUSDT", help="Comma-separated symbols")
+    
+    universe_lib.add_universe_args(p)
+
     p.add_argument("--paper", action="store_true", help="Paper mode (no real orders)")
     p.add_argument("--live", action="store_true", help="Live mode (real orders)")
     p.add_argument(
@@ -149,8 +152,10 @@ def parse_args() -> BotConfig:
         print("[FATAL] Pass either --paper or --live, not both.")
         sys.exit(2)
 
+    selected_universe = universe_lib.resolve_universe(args)
+
     return BotConfig(
-        symbols=[s.strip().upper() for s in args.symbols.split(",") if s.strip()],
+        symbols=selected_universe,
         paper=paper,
         testnet=not args.mainnet,
         threshold_override=args.threshold,

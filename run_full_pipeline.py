@@ -60,6 +60,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+import universe as universe_lib
 
 
 ROOT = Path(__file__).parent.resolve()
@@ -291,12 +292,9 @@ def main():
             "print a before/after comparison."
         )
     )
-    parser.add_argument(
-        "--symbols",
-        type=str,
-        default="BTCUSDT,ETHUSDT,SOLUSDT,BNBUSDT,XRPUSDT,ADAUSDT,AVAXUSDT,LINKUSDT,DOGEUSDT,MATICUSDT",
-        help="Comma-separated symbols (default: 10 majors).",
-    )
+    
+    universe_lib.add_universe_args(parser)
+
     parser.add_argument(
         "--days",
         type=int,
@@ -345,6 +343,10 @@ def main():
 
     py = sys.executable
 
+    # Resolve universe and join into comma-separated string for subprocess flags
+    selected_universe = universe_lib.resolve_universe(args)
+    universe_str = ",".join(selected_universe)
+
     # ── 1. build_global_dataset.py ─────────────────────────────────────────
     if not args.skip_data and not maybe_skip(
         "build_global_dataset.py", GLOBAL_CSV, args.refresh_data
@@ -356,8 +358,10 @@ def main():
                 "build_global_dataset.py",
                 "--days",
                 str(args.days),
+                "--universe",
+                "manual",
                 "--symbols",
-                args.symbols,
+                universe_str,
                 "--output",
                 str(GLOBAL_CSV.name),
             ],
