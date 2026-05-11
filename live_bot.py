@@ -101,8 +101,9 @@ class BotConfig:
     threshold_override: Optional[float] = None  # overrides loaded threshold
     use_raw_threshold: bool = False  # if True, compare raw_proba vs threshold
     funding_min: float = 0.0001  # min funding_rate (1bp/8h) to enter; gates regime edge
-    fill_timeout_sec: float = 30.0
+    fill_timeout_sec: float = 60.0
     poll_interval_sec: float = 60.0  # main loop cadence
+    max_spread_pct: float = 0.1  # 0.1%
 
 
 def parse_args() -> tuple[BotConfig, bool]:
@@ -132,6 +133,8 @@ def parse_args() -> tuple[BotConfig, bool]:
     p.add_argument("--sl", type=float, default=0.02)
     p.add_argument("--max-hold-hours", type=int, default=48)
     p.add_argument("--poll-sec", type=float, default=60.0)
+    p.add_argument("--fill-timeout", type=float, default=60.0)
+    p.add_argument("--max-spread", type=float, default=0.1, help="Max spread %% gate")
     p.add_argument(
         "--funding-min",
         type=float,
@@ -167,6 +170,8 @@ def parse_args() -> tuple[BotConfig, bool]:
         max_hold_hours=args.max_hold_hours,
         poll_interval_sec=args.poll_sec,
         funding_min=args.funding_min,
+        fill_timeout_sec=args.fill_timeout,
+        max_spread_pct=args.max_spread,
     ), args.once
 
 
@@ -527,8 +532,10 @@ def evaluate_symbol(
         client=client,
         filters=ctx.filters,
         best_bid=best_bid,
+        best_ask=best_ask,
         quantity=qty,
         timeout_sec=cfg.fill_timeout_sec,
+        max_spread_pct=cfg.max_spread_pct,
         paper=cfg.paper,
     )
     if not fill.filled:

@@ -55,31 +55,30 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).parent
-DATA_FILE = ROOT / "global_alpha_dataset.csv"
+DATA_FILE = ROOT / "data" / "processed" / "global_alpha_dataset.parquet"
 OOF_FILE = ROOT / "tbm_xgboost_model_v2_oof.csv"
 THRESHOLD_FILE = ROOT / "tbm_xgboost_model_v2_threshold.json"
 LOGS_DIR = ROOT / "pipeline_logs"
 LOGS_DIR.mkdir(exist_ok=True)
 
 
-def realised_return(label: int, tp_pct: float, sl_pct: float) -> float:
-    """Conservative mapping from TBM label to realised return.
+def realised_return(
+    label: int, 
+    tp_pct: float, 
+    sl_pct: float,
+    spread_pct: float = 0.02, # 2bp typical for majors
+    slippage_pct: float = 0.01 # 1bp typical
+) -> float:
+    """Realistic mapping from TBM label to realised return.
 
-    The TBM labeller writes label=1 iff the upper barrier was hit first
-    *before* the lower barrier or the time limit.  label=0 covers both
-    "lower barrier hit first" and "time limit expired without either
-    barrier hit".  Without per-row exit prices we cannot distinguish
-    those two sub-cases, so we adopt the conservative convention:
-
-        label = 1  ->  +tp_pct        (full TP)
-        label = 0  ->  -|sl_pct|      (full SL; pessimistic for time-expiry)
-
-    This intentionally biases the simulator *against* the strategy --
-    a strategy that survives the conservative simulator is real.
+    Adds bid/ask spread impact and execution slippage penalties.
+    label = 1 (TP) -> +tp_pct - spread - slippage
+    label = 0 (SL) -> -sl_pct - spread - slippage
     """
+    penalty = (spread_pct + slippage_pct) / 100.0
     if label == 1:
-        return float(tp_pct)
-    return -abs(float(sl_pct))
+        return float(tp_pct) - penalty
+    return -abs(float(sl_pct)) - penalty
 
 
 def simulate(
@@ -87,7 +86,10 @@ def simulate(
     threshold: float,
     tp_pct: float,
     sl_pct: float,
-    fee_pct: float,
+    maker_fee_pct: float,
+    taker_fee_pct: float,
+    spread_pct: float,
+    slippage_pct: float,
     max_concurrent_per_symbol: int = 1,
 ) -> dict:
     """Walk-forward chronological simulation.
@@ -98,17 +100,17 @@ def simulate(
         timestamp, symbol, oof_proba, tbm_label, barrier_hit_time
         (must already be sorted by timestamp).
     threshold : probability cutoff for "act"
-    tp_pct, sl_pct : barrier sizes (sl_pct > 0; sign applied by realised_return)
-    fee_pct : per-side fee (round-trip = 2 * fee_pct)
+    tp_pct, sl_pct : barrier sizes (sl_pct > 0)
+    maker_fee_pct : entry fee (assuming smart limit chase)
+    taker_fee_pct : exit fee (assuming TP/SL market trigger)
+    spread_pct : bid/ask spread in %
+    slippage_pct : execution slippage in %
     max_concurrent_per_symbol : 1 enforces "no overlap on a symbol";
-        keep at 1 to mirror the live bot.
     """
     trades: list[dict] = []
     skipped_overlap = 0
     skipped_below_thr = 0
 
-    # Per-symbol "blocked until" timestamp -- we cannot enter a new
-    # trade on this symbol until the previous one has exited.
     blocked_until: dict[str, pd.Timestamp] = {}
 
     for _, row in df.iterrows():
@@ -127,9 +129,10 @@ def simulate(
         bht = int(row["barrier_hit_time"])
         label = int(row["tbm_label"])
 
-        # Round-trip fee = 2 * fee_pct (entry + exit, both at full notional).
-        gross = realised_return(label, tp_pct, sl_pct)
-        net = gross - 2.0 * fee_pct
+        # Entry = Maker, Exit = Taker
+        gross = realised_return(label, tp_pct, sl_pct, spread_pct, slippage_pct)
+        total_fees = maker_fee_pct + taker_fee_pct
+        net = gross - total_fees
 
         exit_ts = ts + pd.Timedelta(hours=bht)
         blocked_until[sym] = exit_ts
@@ -143,7 +146,7 @@ def simulate(
                 "bars_held": bht,
                 "label": label,
                 "gross_return": gross,
-                "fee_paid": 2.0 * fee_pct,
+                "fee_paid": total_fees,
                 "net_return": net,
             }
         )
@@ -229,7 +232,10 @@ def main() -> None:
     )
     parser.add_argument("--tp-pct", type=float, default=None)
     parser.add_argument("--sl-pct", type=float, default=None)
-    parser.add_argument("--fee-pct", type=float, default=None)
+    parser.add_argument("--maker-fee-pct", type=float, default=0.0002, help="Default 0.02%")
+    parser.add_argument("--taker-fee-pct", type=float, default=0.0004, help="Default 0.04%")
+    parser.add_argument("--spread-pct", type=float, default=0.02, help="Default 2bp")
+    parser.add_argument("--slippage-pct", type=float, default=0.01, help="Default 1bp")
     args = parser.parse_args()
 
     # ── Load sidecar config ──────────────────────────────────────────────
@@ -243,19 +249,22 @@ def main() -> None:
     sl_pct = (
         args.sl_pct if args.sl_pct is not None else float(cfg.get("sl_pct", -0.010))
     )
-    fee_pct = (
-        args.fee_pct if args.fee_pct is not None else float(cfg.get("fee_pct", 0.0008))
-    )
     diag_epnl = cfg.get("oof_expected_pnl_per_trade")
 
     print(f"Threshold:       {threshold:.4f}")
-    print(f"TP / SL / fee:   +{tp_pct:.4f} / {sl_pct:.4f} / {fee_pct:.4f}")
+    print(f"TP / SL:         +{tp_pct:.4f} / {sl_pct:.4f}")
+    print(f"Fees (M/T):      {args.maker_fee_pct*100:.4f}% / {args.taker_fee_pct*100:.4f}%")
+    print(f"Spread/Slip:     {args.spread_pct:.4f}% / {args.slippage_pct:.4f}%")
+    
     if diag_epnl is not None:
         print(f"Diagnostic EPnL: {diag_epnl * 100:.4f}% per trade  (analytic)")
 
     # ── Load and join data ───────────────────────────────────────────────
     print(f"\nLoading dataset from {args.data}...")
-    df = pd.read_csv(args.data, parse_dates=["timestamp"])
+    if args.data.endswith(".parquet"):
+        df = pd.read_parquet(args.data)
+    else:
+        df = pd.read_csv(args.data, parse_dates=["timestamp"])
     print(f"  rows: {len(df):,}  symbols: {df['symbol'].nunique()}")
 
     print(f"Loading OOF predictions from {args.oof}...")
@@ -280,7 +289,10 @@ def main() -> None:
         threshold=threshold,
         tp_pct=tp_pct,
         sl_pct=abs(sl_pct),
-        fee_pct=fee_pct,
+        maker_fee_pct=args.maker_fee_pct,
+        taker_fee_pct=args.taker_fee_pct,
+        spread_pct=args.spread_pct,
+        slippage_pct=args.slippage_pct,
     )
 
     # ── Report ───────────────────────────────────────────────────────────
